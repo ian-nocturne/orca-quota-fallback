@@ -1,0 +1,2311 @@
+diff --git a/src/main/claude/claude-structured-launch-resolution.ts b/src/main/claude/claude-structured-launch-resolution.ts
+index 5f4ebdc29e..4f62468c12 100644
+--- a/src/main/claude/claude-structured-launch-resolution.ts
++++ b/src/main/claude/claude-structured-launch-resolution.ts
+@@ -1,3 +1,7 @@
++import {
++  quotaApiEnvironment,
++  type NativeQuotaApiCredential
++} from '../native-chat/quota-fallback-native-auth'
+ import { activeProviderContext } from '../../shared/agent-session-provider-context'
+ import { getClaudeProfileRouter } from '../claude-accounts/claude-profile-installed-router'
+ import { requireLegacyAgentSessionAccountHome } from '../../shared/agent-session-account-home'
+@@ -114,6 +118,7 @@ export type ClaudeStructuredLaunch = {
+ }
+ 
+ export type ClaudeStructuredLaunchPartDeps = {
++  resolveQuotaApiCredential?: (sessionId: string) => Promise<NativeQuotaApiCredential | null>
+   resolveLaunchArgs: () => Promise<string[]> | string[]
+   resolveCommand?: ClaudeEnvDeps['resolveCommand']
+   /** Explicit policy identifies the account for sign-in errors; use claudeStructuredAuthPolicyForSettings. */
+@@ -247,6 +252,11 @@ export function claudeStructuredLaunchPart(
+         hasTranscript: deps.hasTranscript
+       })
+     }
++    const quotaApi = await deps.resolveQuotaApiCredential?.(record.sessionId)
++    if (quotaApi && quotaApi.route !== 'claude-api') {
++      throw new Error('Quota API route does not match Claude')
++    }
++    const quotaEnv = quotaApi ? quotaApiEnvironment(env, quotaApi) : null
+     return {
+       launch: {
+         pathToClaudeCodeExecutable: command,
+@@ -260,7 +270,8 @@ export function claudeStructuredLaunchPart(
+             ...configured.extraArgs,
+             ...CLAUDE_STRUCTURED_BASE_OPTIONS.extraArgs,
+             ...permission.extraArgs,
+-            ...thinkingDisplayArgs
++            ...thinkingDisplayArgs,
++            ...(quotaApi ? { 'max-budget-usd': String(quotaApi.maxDebitUsd) } : {})
+           },
+           // Claude owns where a resumed conversation continues; the stored leaf is Orca's bookkeeping.
+           ...(resumesTranscript
+@@ -276,8 +287,8 @@ export function claudeStructuredLaunchPart(
+           ? { forkedFromKey: agentSessionProviderHandleKey(head) }
+           : {})
+       },
+-      env,
+-      inheritedEnvToDelete: [],
++      env: quotaEnv?.env ?? env,
++      inheritedEnvToDelete: quotaEnv?.removed ?? [],
+       // The agent runtime follows Orca's CLI directory on PATH so another orca cannot shadow it.
+       cliRuntimeCommand: command
+     }
+diff --git a/src/main/claude/claude-usage-limits.test.ts b/src/main/claude/claude-usage-limits.test.ts
+index 9d3140227c..32aabf983f 100644
+--- a/src/main/claude/claude-usage-limits.test.ts
++++ b/src/main/claude/claude-usage-limits.test.ts
+@@ -115,6 +115,7 @@ describe('a Claude usage limit', () => {
+           ...limitRow,
+           failure: {
+             ...limitRow.failure,
++            usageLimit: { ...limitRow.failure.usageLimit, providerCode: 'usage_limit_reached' },
+             detail: { text: `${LIMIT_TEXT}\nRequest failed`, audience: 'person' }
+           }
+         },
+@@ -233,7 +234,7 @@ describe('a Claude usage limit', () => {
+       t.handle(failedResult('expired', 2200, 'Request rejected'))
+       const limits = statusRows(t).filter((row) => row.failure?.kind === 'usageLimitReached')
+       expect(limits).toHaveLength(1)
+-      expect(limits[0]?.failure?.usageLimit).toBeUndefined()
++      expect(limits[0]?.failure?.usageLimit).toEqual({ providerCode: 'usage_limit_reached' })
+       t.translator.dispose()
+     } finally {
+       clock.mockRestore()
+diff --git a/src/main/claude/claude-usage-limits.ts b/src/main/claude/claude-usage-limits.ts
+index 0e92b63d4b..3b85f95aba 100644
+--- a/src/main/claude/claude-usage-limits.ts
++++ b/src/main/claude/claude-usage-limits.ts
+@@ -41,6 +41,7 @@ function messageText(message: Record<string, unknown>): string {
+ 
+ export type ClaudeUsageLimitEvidence = {
+   cause: 'quota' | 'other' | 'untyped'
++  explicitProviderCode?: true
+ }
+ 
+ // Account observations outlive turns because unchanged rejection notifications are throttled.
+@@ -68,9 +69,14 @@ export class ClaudeUsageLimits {
+     const root = message.parent_tool_use_id == null
+     const decision = !typed && root ? (turn?.usageLimitEvidence?.cause ?? cause) : cause
+     const row =
+-      decision !== 'other' && refused ? this.row(messageText(message), decision === 'quota') : null
++      decision !== 'other' && refused
++        ? this.row(messageText(message), decision === 'quota', typed === 'usage_limit_reached')
++        : null
+     if (root && turn?.isOpen && (typed || (refused && decision === 'untyped'))) {
+-      turn.usageLimitEvidence = { cause: row ? 'quota' : cause }
++      turn.usageLimitEvidence = {
++        cause: row ? 'quota' : cause,
++        ...(typed === 'usage_limit_reached' ? { explicitProviderCode: true as const } : {})
++      }
+     }
+     return row
+   }
+@@ -93,7 +99,11 @@ export class ClaudeUsageLimits {
+     if (!limited) {
+       return null
+     }
+-    return this.row(claudeText(message.result) ?? '', evidence?.cause === 'quota')
++    return this.row(
++      claudeText(message.result) ?? '',
++      evidence?.cause === 'quota',
++      evidence?.explicitProviderCode === true
++    )
+   }
+ 
+   private record(info: Record<string, unknown> | null): void {
+@@ -134,7 +144,11 @@ export class ClaudeUsageLimits {
+     return { ...(window ? { window } : {}), ...(resetsAt ? { resetsAt } : {}) }
+   }
+ 
+-  private row(providerText: string, typed = false): ClaudeUsageLimitRow | null {
++  private row(
++    providerText: string,
++    typed = false,
++    explicitProviderCode = typed
++  ): ClaudeUsageLimitRow | null {
+     const limit = this.limit()
+     if (!limit && !typed) {
+       return null
+@@ -144,7 +158,14 @@ export class ClaudeUsageLimits {
+       tone: 'warning',
+       ...agentSessionFailureWords(
+         agentSessionFailureFact('usageLimitReached', {
+-          ...(limit && (limit.window || limit.resetsAt) ? { usageLimit: limit } : {}),
++          ...((limit && (limit.window || limit.resetsAt)) || typed
++            ? {
++                usageLimit: {
++                  ...limit,
++                  ...(explicitProviderCode ? { providerCode: 'usage_limit_reached' as const } : {})
++                }
++              }
++            : {}),
+           detail: providerDiagnostic(providerText, 'person')
+         }),
+         { agentName: 'Claude', provider: 'claude', surface: 'row' }
+diff --git a/src/main/codex/codex-structured-launch-resolution.ts b/src/main/codex/codex-structured-launch-resolution.ts
+index f5e9915617..d29cd7b2e2 100644
+--- a/src/main/codex/codex-structured-launch-resolution.ts
++++ b/src/main/codex/codex-structured-launch-resolution.ts
+@@ -1,3 +1,9 @@
++import {
++  quotaApiEnvironment,
++  quotaCodexProviderArgs,
++  QUOTA_CODEX_PROVIDER,
++  type NativeQuotaApiCredential
++} from '../native-chat/quota-fallback-native-auth'
+ import { delimiter, isAbsolute, resolve } from 'node:path'
+ import { waitForPromiseWithSignal } from '../../shared/abort-signal-reason'
+ import { requireLegacyAgentSessionAccountHome } from '../../shared/agent-session-account-home'
+@@ -15,6 +21,8 @@ import {
+ } from '../native-chat/native-chat-visuals-delivery'
+ 
+ export type CodexStructuredLaunchPartDeps = {
++  restoreQuotaOpenaiSubscription?: (sessionId: string) => boolean
++  resolveQuotaApiCredential?: (sessionId: string) => Promise<NativeQuotaApiCredential | null>
+   resolveLaunchArgs: () => Promise<string[]> | string[]
+   resolveCommand?: (options?: { pathEnv?: string | null; homePath?: string }) => string
+ }
+@@ -98,10 +106,30 @@ export function codexStructuredLaunchPart(
+     const model = record.options?.model
+     const visuals = await basis.visuals()
+     await basis.launchDirectory()
++    const quotaApi = await deps.resolveQuotaApiCredential?.(record.sessionId)
++    if (quotaApi && quotaApi.route !== 'openai-api') {
++      throw new Error('Quota API route does not match Codex')
++    }
++    const restoreOpenai =
++      !quotaApi && deps.restoreQuotaOpenaiSubscription?.(record.sessionId) === true
++    const quotaEnv = quotaApi ? quotaApiEnvironment(environment, quotaApi) : null
+     return {
+       launch: {
+         command,
+-        args: [...args, 'app-server'],
++        args: [
++          ...args,
++          ...(quotaApi
++            ? quotaCodexProviderArgs()
++            : restoreOpenai
++              ? ['-c', 'model_provider="openai"']
++              : []),
++          'app-server'
++        ],
++        ...(quotaApi
++          ? { modelProvider: QUOTA_CODEX_PROVIDER }
++          : restoreOpenai
++            ? { modelProvider: 'openai' }
++            : {}),
+         codexHome: accountHome.path,
+         resumeThreadId,
+         // Only created threads may be unsaved; resumed, forked and adopted threads were persisted.
+@@ -114,11 +142,15 @@ export function codexStructuredLaunchPart(
+         ...(visuals ? { visuals } : {})
+       },
+       env: withNativeChatVisualsEnv(
+-        { ...environment, ...(accountHome.path ? { CODEX_HOME: accountHome.path } : {}) },
++        {
++          ...(quotaEnv?.env ?? environment),
++          ...(accountHome.path ? { CODEX_HOME: accountHome.path } : {})
++        },
+         visuals
+       ),
+       // Clear inherited scratch paths that may belong to another chat.
+       inheritedEnvToDelete: [
++        ...(quotaEnv?.removed ?? []),
+         ...(visuals ? [] : [NATIVE_CHAT_SCRATCH_DIR_ENV]),
+         LEGACY_NATIVE_CHAT_VISUALS_DIR_ENV
+       ],
+diff --git a/src/main/codex/codex-structured-session-state.ts b/src/main/codex/codex-structured-session-state.ts
+index b17e19727c..302eb57c7a 100644
+--- a/src/main/codex/codex-structured-session-state.ts
++++ b/src/main/codex/codex-structured-session-state.ts
+@@ -46,6 +46,7 @@ export type CodexStructuredLaunch = {
+   cwd: string
+   codexHome: string | null
+   resumeThreadId: string | null
++  modelProvider?: string
+   /** Replace an unsaved thread created by this session; never supersede a proven resume. */
+   supersedeIfUnsaved?: boolean
+   permissionPolicy?: CodexStructuredPermissionPolicy
+diff --git a/src/main/codex/codex-structured-thread-open.ts b/src/main/codex/codex-structured-thread-open.ts
+index 542ba54cba..310b0b8764 100644
+--- a/src/main/codex/codex-structured-thread-open.ts
++++ b/src/main/codex/codex-structured-thread-open.ts
+@@ -48,6 +48,7 @@ export async function openCodexThread(
+   launch: {
+     cwd: string
+     resumeThreadId: string | null
++    modelProvider?: string
+     supersedeIfUnsaved?: boolean
+     permissionPolicy?: CodexStructuredPermissionPolicy
+     /** Avoid a duplicate base prompt caused by switching models on the first turn. */
+@@ -63,6 +64,7 @@ export async function openCodexThread(
+   const config = { ...launch.threadConfig, ...shellEnvironmentSetConfig(launch.commandEnv) }
+   const threadSettings = {
+     cwd: launch.cwd,
++    ...(launch.modelProvider ? { modelProvider: launch.modelProvider } : {}),
+     ...launch.permissionPolicy,
+     ...(Object.keys(config).length > 0 ? { config } : {})
+   }
+@@ -123,6 +125,9 @@ export async function openCodexThread(
+     throw new Error(`codex app-server resumed ${threadId} instead of ${resumeThreadId}`)
+   }
+   const result = opened as Record<string, unknown>
++  if (launch.modelProvider && result.modelProvider !== launch.modelProvider) {
++    throw new Error('Codex did not confirm the requested API billing provider')
++  }
+   const thread =
+     typeof result.thread === 'object' && result.thread !== null
+       ? (result.thread as Record<string, unknown>)
+diff --git a/src/main/codex/codex-usage-limits.test.ts b/src/main/codex/codex-usage-limits.test.ts
+index 3beaac80a6..d0f19d323e 100644
+--- a/src/main/codex/codex-usage-limits.test.ts
++++ b/src/main/codex/codex-usage-limits.test.ts
+@@ -55,7 +55,11 @@ describe('a Codex usage limit', () => {
+         text: 'Codex hit its weekly limit.',
+         failure: {
+           kind: 'usageLimitReached',
+-          usageLimit: { window: 'weekly', resetsAt: RESETS_AT_S * 1000 },
++          usageLimit: {
++            window: 'weekly',
++            resetsAt: RESETS_AT_S * 1000,
++            providerCode: 'usageLimitExceeded'
++          },
+           detail: { text: CODEX_WORDS, audience: 'person' }
+         }
+       })
+@@ -78,7 +82,10 @@ describe('a Codex usage limit', () => {
+       limitId: null,
+       primary: { usedPercent: 100, windowDurationMins: 43200, resetsAt: RESETS_AT_S + 3600 }
+     })
+-    expect(failure()?.usageLimit).toEqual({ resetsAt: (RESETS_AT_S + 3600) * 1000 })
++    expect(failure()?.usageLimit).toEqual({
++      resetsAt: (RESETS_AT_S + 3600) * 1000,
++      providerCode: 'usageLimitExceeded'
++    })
+     observe({ secondary: { usedPercent: 100, windowDurationMins: 10080 } })
+     expect(failure('rateLimitExceeded')?.usageLimit).toBeUndefined()
+     observe({
+@@ -86,8 +93,11 @@ describe('a Codex usage limit', () => {
+       planType: 'free',
+       primary: { usedPercent: 100, resetsAt: RESETS_AT_S }
+     })
+-    expect(failure()?.usageLimit).toEqual({ resetsAt: RESETS_AT_S * 1000 })
++    expect(failure()?.usageLimit).toEqual({
++      resetsAt: RESETS_AT_S * 1000,
++      providerCode: 'usageLimitExceeded'
++    })
+     observe({ primary: null })
+-    expect(failure()?.usageLimit).toBeUndefined()
++    expect(failure()?.usageLimit).toEqual({ providerCode: 'usageLimitExceeded' })
+   })
+ })
+diff --git a/src/main/codex/codex-usage-limits.ts b/src/main/codex/codex-usage-limits.ts
+index 20ecb34dc4..b76dff5959 100644
+--- a/src/main/codex/codex-usage-limits.ts
++++ b/src/main/codex/codex-usage-limits.ts
+@@ -57,7 +57,16 @@ export class CodexUsageLimits {
+       .join('\n')
+     const limit = this.limit()
+     return agentSessionFailureFact('usageLimitReached', {
+-      ...(limit ? { usageLimit: limit } : {}),
++      ...(limit || error === 'usageLimitExceeded'
++        ? {
++            usageLimit: {
++              ...limit,
++              ...(error === 'usageLimitExceeded'
++                ? { providerCode: 'usageLimitExceeded' as const }
++                : {})
++            }
++          }
++        : {}),
+       detail: providerDiagnostic(text, 'person')
+     })
+   }
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-client-delivery.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-client-delivery.ts
+index 65a2d9e509..8361805116 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-client-delivery.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-client-delivery.ts
+@@ -1,3 +1,4 @@
++import { confirmedQuotaCut } from '../quota-fallback-journal-cut'
+ import { StructuredAgentSessionRequestFailures } from './structured-agent-session-request-failures'
+ import { structuredAgentSessionFailureWordsContext } from './structured-agent-session-send-preparation'
+ import { AT_REST_COMMANDS_READ_BUDGET_MS } from './at-rest-command-catalog'
+@@ -252,6 +253,34 @@ export class StructuredAgentSessionClientDelivery {
+     // Observe completion after status projection updates, even without subscribers for background chats.
+     this.turnCompletionFeed.observe(sessionId, journal)
+     this.queue.onJournalActivity(sessionId, activity)
++    const quotaObserver = this.deps().onConfirmedQuotaCut
++    const work = this.currentWork(sessionId, journal)
++    if (
++      quotaObserver &&
++      !work.working() &&
++      !work.owesAnySend() &&
++      !work.hasActionablePrompt() &&
++      !this.childWorkOpen(sessionId) &&
++      !this.childWorkIncomplete(sessionId)
++    ) {
++      const snapshot = journal.snapshot()
++      const cut = confirmedQuotaCut(sessionId, snapshot.items, snapshot.submissions)
++      if (cut) {
++        try {
++          void Promise.resolve(quotaObserver(cut)).catch(() => {
++            this.deps().logger.warn('quota fallback observer failed', {
++              scope: 'quota-fallback',
++              sessionId
++            })
++          })
++        } catch {
++          this.deps().logger.warn('quota fallback observer failed', {
++            scope: 'quota-fallback',
++            sessionId
++          })
++        }
++      }
++    }
+     for (const observer of this.journalObservers.get(sessionId) ?? []) {
+       try {
+         observer()
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-delivery-loop-deps.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-delivery-loop-deps.ts
+index dfd55afe4d..f08f278e42 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-delivery-loop-deps.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-delivery-loop-deps.ts
+@@ -20,6 +20,7 @@ import type {
+ } from './structured-agent-session-host-types'
+ 
+ export type StructuredAgentSessionDeliveryLoopDeps = {
++  quotaFallbackDeliveryAllowed?: (sessionId: string, operationId: string) => boolean
+   startFlights?: Pick<StructuredAgentSessionStartFlights, 'get'>
+   deliveryOrder: StructuredAgentSessionDeliveryOrder
+   sessions: ReadonlyMap<string, StructuredAgentSessionHostSession>
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-delivery-loop.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-delivery-loop.ts
+index a5ea88e83d..21d2e2c443 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-delivery-loop.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-delivery-loop.ts
+@@ -189,6 +189,12 @@ export class StructuredAgentSessionDeliveryLoop {
+       return this.stop(sessionId)
+     }
+     const oldest = oldestQueuedSubmission(session)
++    if (
++      oldest &&
++      this.deps.quotaFallbackDeliveryAllowed?.(sessionId, oldest.clientMessageId) === false
++    ) {
++      return this.stop(sessionId)
++    }
+     // Commands block while their child lives; ended command commits wake delivery again.
+     const work = this.deps.currentWork(sessionId)
+     if (!oldest || (session.child && work && structuredAgentSessionCommandRunning(work))) {
+@@ -221,6 +227,9 @@ export class StructuredAgentSessionDeliveryLoop {
+     clientMessageId: string,
+     waited: boolean
+   ): Promise<'continue' | 'stop' | StructuredAgentSessionPendingHandover> {
++    if (this.deps.quotaFallbackDeliveryAllowed?.(sessionId, clientMessageId) === false) {
++      return this.stop(sessionId)
++    }
+     const session = this.deps.sessions.get(sessionId)
+     if (!session || this.disposed) {
+       return this.stop(sessionId)
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-host-delivery.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-host-delivery.ts
+index b88a7347c8..973046775c 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-host-delivery.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-host-delivery.ts
+@@ -98,6 +98,7 @@ export function createStructuredAgentSessionConversationDelivery(input: {
+       [...(sessions.get(sessionId)?.child?.heldSends?.() ?? [])].some((id) => id !== continuingId)
+   })
+   const loop = new StructuredAgentSessionDeliveryLoop({
++    quotaFallbackDeliveryAllowed: deps.quotaFallbackDeliveryAllowed,
+     sessions,
+     adapter: deps.adapter,
+     agents: deps.agents,
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-host-mutations.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-host-mutations.ts
+index 5e119580bb..818c9f0239 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-host-mutations.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-host-mutations.ts
+@@ -85,6 +85,22 @@ export function sendStructuredAgentSessionTurn(
+       {
+         ...plan,
+         run: async (ctx) => {
++          if (
++            context.deps.quotaFallbackSendAllowed?.(
++              ctx.sessionId,
++              params.envelope.clientOperationId,
++              caller.callerKey
++            ) === false
++          ) {
++            return {
++              ok: false as const,
++              refusal: refuse(
++                'agent_session_operation_invalid',
++                { reason: 'handoffInFlight' },
++                'A quota continuation owns this session. Wait for it to settle.'
++              )
++            }
++          }
+           const record = context.deps.store.getRecord(ctx.sessionId)
+           const blocked = structuredAgentSessionSendBlock(record)
+           if (blocked) {
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-host-types.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-host-types.ts
+index 63de976541..1dc940c52d 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-host-types.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-host-types.ts
+@@ -1,3 +1,4 @@
++import type { ConfirmedQuotaCut } from '../quota-fallback-journal-cut'
+ import type { StructuredAgentSessionDeliveryLoop } from './structured-agent-session-delivery-loop'
+ import type {
+   OpenedStructuredAgentSessionConversation,
+@@ -176,6 +177,9 @@ export type StructuredAgentSessionHostDeps = {
+    *  drop exactly the failures nobody sees in the UI. */
+   logger: StructuredAgentSessionLogger
+   onRequestFailure?: (failure: StructuredAgentSessionRequestFailure) => void
++  quotaFallbackSendAllowed?: (sessionId: string, operationId: string, callerKey: string) => boolean
++  quotaFallbackDeliveryAllowed?: (sessionId: string, operationId: string) => boolean
++  onConfirmedQuotaCut?: (cut: ConfirmedQuotaCut) => void | Promise<void>
+   /** replay distinguishes restored/projected state from fresh journal events. */
+   onSessionStatusChanged?: (
+     summary: AgentSessionStatusSummary,
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-host.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-host.ts
+index d9a5ed42c2..3b70f1a353 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-host.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-host.ts
+@@ -1,7 +1,8 @@
++import { nativeQuotaLeaseForHost } from '../quota-fallback-native-lease'
+ import { continuationContextReader as contextReader } from './structured-agent-session-continuation-context'
+ import type { AgentSessionRewindParams } from '../../../shared/agent-session-rewind'
+ import { rewindStructuredAgentSession } from './structured-agent-session-rewind'
+-import { StructuredConversationCommandController } from './structured-conversation-command-controller'
++import { StructuredConversationCommandController as Commands } from './structured-conversation-command-controller'
+ // Serialize durable mutations per conversation; open at rest and start a child only when work needs it.
+ 
+ import type { AgentSessionSubscribeInput } from './structured-agent-session-subscribers'
+@@ -35,10 +36,7 @@ import { sleepStructuredAgentSessionWorkspace } from './structured-agent-session
+ export type { StructuredAgentSessionHostDeps } from './structured-agent-session-host-types'
+ 
+ export class StructuredAgentSessionHost {
+-  private readonly conversationCommands = new StructuredConversationCommandController(
+-    () => this.mutationContext(),
+-    this
+-  )
++  private readonly conversationCommands = new Commands(() => this.mutationContext(), this)
+   private readonly sessions = new StructuredAgentSessionConversations({
+     observe: (id, journal, rows) => this.clientDelivery.requestFailures.observe(id, journal, rows),
+     forget: (id) => this.clientDelivery.requestFailures.forget(id),
+@@ -165,7 +163,7 @@ export class StructuredAgentSessionHost {
+ 
+   hasSession = (sessionId: string): boolean => this.sessions.has(sessionId)
+   loadedSessionIds = (): string[] =>
+-    [...this.sessions].flatMap(([sessionId, { child }]) => (child ? [sessionId] : []))
++    [...this.sessions].flatMap(([id, { child }]) => (child ? [id] : []))
+   hasLoadedProviders = (): boolean => this.loadedSessionIds().length > 0
+   sessionAgent = (sessionId: string) => this.deps.store.getConversation(sessionId)?.provider ?? null
+ 
+@@ -173,8 +171,8 @@ export class StructuredAgentSessionHost {
+     this.eventRecovery.handle(event)
+ 
+   // Keep inference so publishStatus stays required in the attach-context spread.
+-  private lifetimeContext() {
+-    return {
++  private lifetimeContext = () =>
++    ({
+       deps: this.deps,
+       runtimeState: this.runtimeState,
+       sessions: this.sessions,
+@@ -183,8 +181,7 @@ export class StructuredAgentSessionHost {
+       generationEnded: this.clientDelivery.publishGenerationEnded,
+       wakeDelivery: (sessionId: string) => this.conversationDelivery.loop.wake(sessionId),
+       endExitedChild: this.eventRecovery.endExitedChildUnderSerialize
+-    } satisfies StructuredAgentSessionLifetimeContext
+-  }
++    }) satisfies StructuredAgentSessionLifetimeContext
+ 
+   private attachContext(): StructuredAgentSessionAttachContext {
+     return {
+@@ -283,6 +280,8 @@ export class StructuredAgentSessionHost {
+       now: () => this.now()
+     })
+ 
++  readonly quotaContinuation = nativeQuotaLeaseForHost(this)
++
+   send = this.conversationCommands.send
+ 
+   queuedMessageSend = this.queued.queuedMessageSend
+@@ -352,6 +351,7 @@ export class StructuredAgentSessionHost {
+   collaboratorsForTests = () => ({
+     sessions: this.sessions,
+     subscribers: this.subscribers,
++    clientDelivery: this.clientDelivery,
+     runtimeState: this.runtimeState,
+     conversationDelivery: this.conversationDelivery,
+     lifetime: this.lifetime,
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-ready-operation-plan.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-ready-operation-plan.ts
+index 707151ec70..ba29828aa7 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-ready-operation-plan.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-ready-operation-plan.ts
+@@ -1,3 +1,8 @@
++import type { AgentSessionMutationResult } from '../../../shared/agent-session-wire'
++import type { StructuredAgentSessionProviderChildIdentity } from './structured-agent-session-host-types'
++import type { StructuredAgentSessionDeliveryPlace } from './structured-agent-session-delivery-order'
++import type { StructuredAgentSessionStartClaim } from './structured-agent-session-agent-start'
++import type { StructuredAgentSessionStartReadiness } from './structured-agent-session-startup-attempt'
+ import type { MutationPlan } from './structured-agent-session-mutation-plans'
+ 
+ export type ReadyOperationPlan<T> = Pick<
+@@ -7,3 +12,13 @@ export type ReadyOperationPlan<T> = Pick<
+   Partial<
+     Pick<MutationPlan<T>, 'replay' | 'rerunWhenReplayMissing' | 'recoverUnknownFromDurableState'>
+   >
++
++export type QueuedReadyOperation<T> =
++  | { result: AgentSessionMutationResult<T> }
++  | {
++      /** null starts a child outside serialization. */
++      child: StructuredAgentSessionProviderChildIdentity | null
++      readiness: StructuredAgentSessionStartReadiness | null
++      start: StructuredAgentSessionStartClaim | null
++      place: StructuredAgentSessionDeliveryPlace
++    }
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-ready-operation.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-ready-operation.ts
+index 9e80a1934a..73c5a3e5f9 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-ready-operation.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-ready-operation.ts
+@@ -1,3 +1,4 @@
++import { quotaContinuationRefusal } from '../quota-fallback-native-guard'
+ import { isAgentSessionRefusalError } from '../../../shared/agent-session-wire-refusals'
+ import {
+   agentSessionFingerprintConflict,
+@@ -9,7 +10,6 @@ import type {
+ } from '../../../shared/agent-session-wire'
+ import type { AgentSessionRecord } from '../../../shared/agent-session-record'
+ import type { StructuredAgentSessionMutationContext } from './structured-agent-session-mutation-context'
+-import type { StructuredAgentSessionProviderChildIdentity } from './structured-agent-session-host-types'
+ import { STRUCTURED_AGENT_SESSION_START_WAIT_MS } from './structured-agent-session-send-settlement'
+ import { openForWrite, rewindInDoubt } from './structured-agent-session-send-preparation'
+ import { agentSessionOperationOutcomeUnknown } from './structured-agent-session-replay-outcome'
+@@ -17,14 +17,14 @@ import {
+   replayRecordedOperation,
+   type AgentSessionMutationSessionPreparation
+ } from './structured-agent-session-mutation-admission'
+-import type { ReadyOperationPlan } from './structured-agent-session-ready-operation-plan'
++import type {
++  ReadyOperationPlan,
++  QueuedReadyOperation
++} from './structured-agent-session-ready-operation-plan'
+ import { mutationReplayContext } from './structured-agent-session-mutation-turn-context'
+ import { commandReceiptScope } from '../agent-session-journal/command-receipt-schema'
+ import { parseAgentSessionOperationTimestamp } from '../../../shared/agent-session-host-authority'
+ import { waitForStructuredAgentSessionStart } from './structured-agent-session-start-readiness'
+-import type { StructuredAgentSessionDeliveryPlace } from './structured-agent-session-delivery-order'
+-import type { StructuredAgentSessionStartClaim } from './structured-agent-session-agent-start'
+-import type { StructuredAgentSessionStartReadiness } from './structured-agent-session-startup-attempt'
+ 
+ import { waitForPromiseWithSignal } from '../../../shared/abort-signal-reason'
+ 
+@@ -40,16 +40,6 @@ export {
+   type ReadyOperationSelection
+ } from './structured-agent-session-operation-child'
+ 
+-type QueuedReadyOperation<T> =
+-  | { result: AgentSessionMutationResult<T> }
+-  | {
+-      /** null starts a child outside serialization. */
+-      child: StructuredAgentSessionProviderChildIdentity | null
+-      readiness: StructuredAgentSessionStartReadiness | null
+-      start: StructuredAgentSessionStartClaim | null
+-      place: StructuredAgentSessionDeliveryPlace
+-    }
+-
+ export async function runAfterRewindStart<T>(
+   context: StructuredAgentSessionMutationContext,
+   callerKey: string,
+@@ -89,6 +79,10 @@ export async function runWithReadyStructuredAgentSessionOperation<T>(
+   const preparedOperation = context.serialize<QueuedReadyOperation<T>>(
+     envelope.sessionId,
+     async () => {
++      const quotaRefusal = quotaContinuationRefusal(context.deps, callerKey, envelope)
++      if (quotaRefusal) {
++        return { result: { ok: false, refusal: quotaRefusal } }
++      }
+       authority = options.goal
+         ? context.acquireAborts.begin(envelope.sessionId, false, true)
+         : undefined
+@@ -297,10 +291,13 @@ export async function runWithReadyStructuredAgentSessionOperation<T>(
+       return operationDidNotRun(true)
+     }
+     const ran = child
+-    return await context.serialize(envelope.sessionId, () =>
+-      // Re-read after readiness so competing settlement wins admission.
+-      run({ ok: true, child: ran, deadline, signal: authority?.signal })
+-    )
++    return await context.serialize(envelope.sessionId, async () => {
++      const quotaRefusal = quotaContinuationRefusal(context.deps, callerKey, envelope)
++      if (quotaRefusal) {
++        return { ok: false, refusal: quotaRefusal }
++      }
++      return run({ ok: true, child: ran, deadline, signal: authority?.signal })
++    })
+   } finally {
+     authority?.end()
+     selected.place.release()
+diff --git a/src/main/native-chat/quota-fallback-journal-cut.ts b/src/main/native-chat/quota-fallback-journal-cut.ts
+new file mode 100644
+index 0000000000..700827ec67
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-journal-cut.ts
+@@ -0,0 +1,33 @@
++import { readAgentSessionFailureFact } from '../../shared/agent-session-failure'
++import { latestNativeChatUsageLimitCut } from '../../shared/native-chat/native-chat-usage-limit-cut'
++import { findInNativeChatTurn } from '../../shared/native-chat/native-chat-orca-stop-cut'
++import { isRootAgentJournalItem } from '../../shared/agent-session-journal-producer'
++import type {
++  AgentJournalRenderItem,
++  AgentJournalSubmission
++} from '../../shared/agent-session-journal-types'
++
++export type ConfirmedQuotaCut = {
++  sessionId: string
++  turnItemId: string
++  errorCode: 'usage_limit_reached' | 'usageLimitExceeded'
++}
++
++export function confirmedQuotaCut(
++  sessionId: string,
++  items: readonly AgentJournalRenderItem[],
++  submissions: readonly Pick<AgentJournalSubmission, 'dispatchState'>[]
++): ConfirmedQuotaCut | null {
++  const cut = latestNativeChatUsageLimitCut(items, submissions)
++  if (!cut) {
++    return null
++  }
++  const errorCode = findInNativeChatTurn(items, cut.turnItemId, (item) => {
++    if (!isRootAgentJournalItem(item) || item.body.kind !== 'status') {
++      return null
++    }
++    const failure = readAgentSessionFailureFact(item.body.failure)
++    return failure?.kind === 'usageLimitReached' ? (failure.usageLimit?.providerCode ?? null) : null
++  })
++  return errorCode ? { sessionId, turnItemId: cut.turnItemId, errorCode } : null
++}
+diff --git a/src/main/native-chat/quota-fallback-ledger.test.ts b/src/main/native-chat/quota-fallback-ledger.test.ts
+new file mode 100644
+index 0000000000..c5c75c1404
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-ledger.test.ts
+@@ -0,0 +1,55 @@
++import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, expect, it } from 'vitest'
++import { QuotaFallbackLedger, type QuotaFallbackClaim } from './quota-fallback-ledger'
++
++const directories: string[] = []
++function fixture() {
++  const directory = mkdtempSync(join(tmpdir(), 'orca-quota-'))
++  directories.push(directory)
++  return { directory, ledger: new QuotaFallbackLedger(directory) }
++}
++afterEach(() => {
++  for (const directory of directories.splice(0)) {
++    rmSync(directory, { recursive: true })
++  }
++})
++const claim: QuotaFallbackClaim = {
++  operationId: 'session:turn:generation',
++  sessionId: 'session',
++  route: 'claude-api',
++  pool: 'account',
++  maxDebitUsd: 2,
++  remainingUsd: 3
++}
++it('does not replay after a process restart or uncertain dispatch', () => {
++  const { ledger, directory } = fixture()
++  expect(ledger.claim(claim)).toBe('claimed')
++  ledger.settle(claim.operationId, 'unknown')
++  expect(new QuotaFallbackLedger(directory).claim(claim)).toBe('duplicate')
++  expect(ledger.claim({ ...claim, operationId: 'other' })).toBe('sessionBusy')
++})
++it('reserves shared credit across sessions, retaining completed maximum cost conservatively', () => {
++  const { ledger } = fixture()
++  expect(ledger.claim(claim)).toBe('claimed')
++  ledger.settle(claim.operationId, 'completed')
++  expect(ledger.claim({ ...claim, operationId: 'next', sessionId: 'second' })).toBe('budgetHeld')
++})
++it('blocks on an unreconciled crashed writer lock', () => {
++  const { ledger, directory } = fixture()
++  mkdirSync(join(directory, 'lock'))
++  expect(() => ledger.claim(claim)).toThrow()
++})
++it('does not reset a corrupt ledger or missing operation', () => {
++  const { ledger, directory } = fixture()
++  expect(() => ledger.settle('missing', 'completed')).toThrow()
++  writeFileSync(join(directory, 'ledger.json'), 'corrupt')
++  expect(() => ledger.claim(claim)).toThrow()
++})
++it('does not admit unlimited API reservations', () => {
++  const { ledger } = fixture()
++  for (const maxDebitUsd of [0, -1, Infinity, Number.NaN]) {
++    expect(() => ledger.claim({ ...claim, maxDebitUsd })).toThrow()
++  }
++})
+diff --git a/src/main/native-chat/quota-fallback-ledger.ts b/src/main/native-chat/quota-fallback-ledger.ts
+new file mode 100644
+index 0000000000..4078a2f21a
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-ledger.ts
+@@ -0,0 +1,126 @@
++import { createHash } from 'node:crypto'
++import {
++  closeSync,
++  fsyncSync,
++  mkdirSync,
++  openSync,
++  readFileSync,
++  renameSync,
++  rmSync,
++  writeFileSync
++} from 'node:fs'
++import { join } from 'node:path'
++import { z } from 'zod'
++import type { QuotaFallbackRoute } from './quota-fallback-policy'
++
++const Entry = z.object({
++  sessionId: z.string().min(1),
++  route: z.enum(['antigravity-opus', 'claude-api', 'openai-api']),
++  pool: z.string().min(1),
++  reservedUsd: z.number().finite().nonnegative(),
++  status: z.enum(['claimed', 'accepted', 'unknown', 'completed'])
++})
++const State = z.record(z.string(), Entry)
++
++export type QuotaFallbackClaim = {
++  operationId: string
++  sessionId: string
++  route: QuotaFallbackRoute
++  pool: string
++  maxDebitUsd: number
++  remainingUsd: number
++}
++
++export class QuotaFallbackLedger {
++  constructor(private readonly directory: string) {
++    mkdirSync(directory, { recursive: true, mode: 0o700 })
++  }
++
++  private transaction<T>(run: (state: z.infer<typeof State>) => T): T {
++    const lock = join(this.directory, 'lock')
++    mkdirSync(lock, { mode: 0o700 })
++    try {
++      const file = join(this.directory, 'ledger.json')
++      let state: z.infer<typeof State>
++      try {
++        state = State.parse(JSON.parse(readFileSync(file, 'utf8')))
++      } catch (error) {
++        if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') {
++          throw error
++        }
++        state = {}
++      }
++      const result = run(state)
++      const temporary = join(this.directory, 'ledger.tmp')
++      writeFileSync(temporary, JSON.stringify(state), { mode: 0o600, flush: true })
++      renameSync(temporary, file)
++      if (process.platform !== 'win32') {
++        const directory = openSync(this.directory, 'r')
++        try {
++          fsyncSync(directory)
++        } finally {
++          closeSync(directory)
++        }
++      }
++      return result
++    } finally {
++      rmSync(lock, { recursive: true })
++    }
++  }
++
++  claim(input: QuotaFallbackClaim): 'claimed' | 'duplicate' | 'sessionBusy' | 'budgetHeld' {
++    if (!input.operationId || !input.sessionId || !input.pool) {
++      throw new Error('Missing claim identity')
++    }
++    if (
++      !Number.isFinite(input.maxDebitUsd) ||
++      input.maxDebitUsd < 0 ||
++      !Number.isFinite(input.remainingUsd) ||
++      input.remainingUsd < 0 ||
++      (input.route !== 'antigravity-opus' && input.maxDebitUsd === 0)
++    ) {
++      throw new Error('Invalid credit reservation')
++    }
++    const key = createHash('sha256').update(input.operationId).digest('hex')
++    return this.transaction((state) => {
++      if (Object.hasOwn(state, key)) {
++        return 'duplicate'
++      }
++      if (
++        Object.values(state).some(
++          (entry) => entry.sessionId === input.sessionId && entry.status !== 'completed'
++        )
++      ) {
++        return 'sessionBusy'
++      }
++      const reserved = Object.values(state)
++        .filter((entry) => entry.pool === input.pool)
++        .reduce((sum, entry) => sum + entry.reservedUsd, 0)
++      if (reserved + input.maxDebitUsd > input.remainingUsd) {
++        return 'budgetHeld'
++      }
++      state[key] = {
++        sessionId: input.sessionId,
++        route: input.route,
++        pool: input.pool,
++        reservedUsd: input.maxDebitUsd,
++        status: 'claimed'
++      }
++      return 'claimed'
++    })
++  }
++
++  settle(operationId: string, status: 'accepted' | 'unknown' | 'completed'): void {
++    const key = createHash('sha256').update(operationId).digest('hex')
++    this.transaction((state) => {
++      const entry = state[key]
++      if (!entry) {
++        throw new Error('Unknown fallback operation')
++      }
++      if (entry.status === 'completed') {
++        return
++      }
++      entry.status = status
++    })
++  }
++}
+diff --git a/src/main/native-chat/quota-fallback-native-auth.ts b/src/main/native-chat/quota-fallback-native-auth.ts
+new file mode 100644
+index 0000000000..a417408db0
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-native-auth.ts
+@@ -0,0 +1,52 @@
++export type NativeQuotaApiCredential = {
++  route: 'claude-api' | 'openai-api'
++  apiKey: string
++  maxDebitUsd: number
++}
++
++export function quotaApiEnvironment(
++  inherited: Readonly<Record<string, string>>,
++  credential: NativeQuotaApiCredential
++): { env: Record<string, string>; removed: string[] } {
++  if (
++    !credential.apiKey ||
++    /[\r\n]/.test(credential.apiKey) ||
++    !Number.isFinite(credential.maxDebitUsd) ||
++    credential.maxDebitUsd <= 0
++  ) {
++    throw new Error('Invalid quota API credential')
++  }
++  const env = { ...inherited }
++  const removed: string[] = []
++  const pattern =
++    credential.route === 'claude-api'
++      ? /^(ANTHROPIC_|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_USE_)/i
++      : /^(OPENAI_API_KEY|OPENAI_BASE_URL|CODEX_API_KEY|ORCA_QUOTA_API_KEY)$/i
++  for (const name of Object.keys(env)) {
++    if (pattern.test(name)) {
++      delete env[name]
++      removed.push(name)
++    }
++  }
++  const name = credential.route === 'claude-api' ? 'ANTHROPIC_API_KEY' : 'ORCA_QUOTA_API_KEY'
++  env[name] = credential.apiKey
++  return { env, removed: removed.filter((key) => key !== name) }
++}
++
++export const QUOTA_CODEX_PROVIDER = 'orca_quota_api'
++export function quotaCodexProviderArgs(): string[] {
++  return [
++    '-c',
++    `model_provider="${QUOTA_CODEX_PROVIDER}"`,
++    '-c',
++    `model_providers.${QUOTA_CODEX_PROVIDER}.name="OpenAI API credit"`,
++    '-c',
++    `model_providers.${QUOTA_CODEX_PROVIDER}.base_url="https://api.openai.com/v1"`,
++    '-c',
++    `model_providers.${QUOTA_CODEX_PROVIDER}.wire_api="responses"`,
++    '-c',
++    `model_providers.${QUOTA_CODEX_PROVIDER}.env_key="ORCA_QUOTA_API_KEY"`,
++    '-c',
++    `model_providers.${QUOTA_CODEX_PROVIDER}.requires_openai_auth=false`
++  ]
++}
+diff --git a/src/main/native-chat/quota-fallback-native-config.ts b/src/main/native-chat/quota-fallback-native-config.ts
+new file mode 100644
+index 0000000000..73d108e9be
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-native-config.ts
+@@ -0,0 +1,42 @@
++import type { AgentSessionRecord } from '../../shared/agent-session-record'
++import type { StructuredAgentSessionHost } from './agent-session-wire/structured-agent-session-host'
++import type { ConfirmedQuotaCut } from './quota-fallback-journal-cut'
++import type { QuotaFallbackCandidate } from './quota-fallback-policy'
++export type NativeQuotaFallbackConfig = {
++  enabled: boolean
++  /** Verification must be host/account/model-specific, fresh, and prove a provider-side debit cap. */
++  verify(input: { record: AgentSessionRecord; cut: ConfirmedQuotaCut }): Promise<{
++    billing: 'subscription' | 'api'
++    pool: string
++    credentialRef: string
++    candidates: readonly QuotaFallbackCandidate[]
++    maxDebitEnforced: boolean
++  } | null>
++  readApiKey(
++    route: 'claude-api' | 'openai-api',
++    account: { pool: string; credentialRef: string }
++  ): Promise<string>
++  report?(sessionId: string, outcome: string): void
++}
++
++export type NativeQuotaHost = Pick<
++  StructuredAgentSessionHost,
++  | 'deps'
++  | 'quotaContinuation'
++  | 'send'
++  | 'journalSnapshot'
++  | 'observeJournalPublications'
++  | 'currentWork'
++>
++
++export function reportQuotaOutcome(
++  config: NativeQuotaFallbackConfig | undefined,
++  sessionId: string,
++  outcome: string
++): void {
++  try {
++    config?.report?.(sessionId, outcome)
++  } catch {
++    /* Reporting cannot change ownership. */
++  }
++}
+diff --git a/src/main/native-chat/quota-fallback-native-controller.ts b/src/main/native-chat/quota-fallback-native-controller.ts
+new file mode 100644
+index 0000000000..1f4f89079e
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-native-controller.ts
+@@ -0,0 +1,302 @@
++import { reportQuotaOutcome } from './quota-fallback-native-config'
++import type { NativeQuotaFallbackConfig, NativeQuotaHost } from './quota-fallback-native-config'
++import { verifyNativeQuotaCredential } from './quota-fallback-native-credential'
++import { createHash } from 'node:crypto'
++import { join } from 'node:path'
++import { structuredAgentSessionMessageSendMutation } from '../../shared/structured-agent-session-send-mutation'
++import { latestNativeChatTurnSinceRequest } from '../../shared/native-chat/native-chat-orca-stop-cut'
++import { decideQuotaFallback } from './quota-fallback-policy'
++import { QuotaFallbackLedger } from './quota-fallback-ledger'
++import {
++  NativeQuotaReservationStore,
++  type NativeQuotaReservation
++} from './quota-fallback-native-store'
++import type { NativeQuotaApiCredential } from './quota-fallback-native-auth'
++import type { ConfirmedQuotaCut } from './quota-fallback-journal-cut'
++
++export const QUOTA_CONTINUATION_CALLER = 'trusted-local:quota-fallback'
++
++export class NativeQuotaContinuationController {
++  private disposed = false
++  private readonly reservations: NativeQuotaReservationStore
++  private readonly ledger: QuotaFallbackLedger
++  private readonly preparing = new Set<string>()
++  private readonly active = new Set<string>()
++  private readonly observing = new Set<string>()
++  private readonly subscriptions = new Map<string, () => void>()
++  constructor(
++    private readonly deps: {
++      stateDirectory: string
++      hostId: string
++      host(): NativeQuotaHost | null
++      config?: NativeQuotaFallbackConfig
++      now?: () => number
++    }
++  ) {
++    const directory = join(deps.stateDirectory, 'quota-fallback')
++    this.reservations = new NativeQuotaReservationStore(directory)
++    this.ledger = new QuotaFallbackLedger(directory)
++  }
++  private now(): number {
++    return (this.deps.now ?? Date.now)()
++  }
++  private report(sessionId: string, outcome: string): void {
++    reportQuotaOutcome(this.deps.config, sessionId, outcome)
++  }
++  readonly restoreOpenaiSubscription = (sessionId: string): boolean =>
++    this.reservations.completedOpenai(sessionId)
++  readonly sendAllowed = (sessionId: string, operationId: string, caller: string): boolean => {
++    const entry = this.reservations.read(sessionId)
++    return (
++      !entry ||
++      (this.deps.host()?.quotaContinuation.allowed(sessionId, entry.sourceTurnId) === true &&
++        caller === QUOTA_CONTINUATION_CALLER &&
++        this.active.has(sessionId) &&
++        operationId === entry.operationId &&
++        entry.phase === 'dispatching')
++    )
++  }
++  readonly deliveryAllowed = (sessionId: string, operationId: string): boolean => {
++    const entry = this.reservations.read(sessionId)
++    return (
++      !entry ||
++      (this.deps.host()?.quotaContinuation.allowed(sessionId, entry.sourceTurnId) === true &&
++        this.active.has(sessionId) &&
++        operationId === entry.operationId &&
++        entry.phase === 'dispatching')
++    )
++  }
++  readonly onCut = async (cut: ConfirmedQuotaCut): Promise<void> => {
++    if (
++      this.disposed ||
++      !this.deps.config?.enabled ||
++      this.preparing.has(cut.sessionId) ||
++      this.reservations.read(cut.sessionId)
++    ) {
++      return
++    }
++    this.preparing.add(cut.sessionId)
++    try {
++      const host = this.deps.host()
++      const record = host?.deps.store.getRecord(cut.sessionId)
++      if (!host || !record || (record.provider !== 'claude' && record.provider !== 'codex')) {
++        return
++      }
++      const verified = await this.deps.config.verify({ record, cut })
++      if (this.disposed) {
++        return
++      }
++      if (!verified || !verified.maxDebitEnforced) {
++        this.report(cut.sessionId, 'noVerifiedCreditCap')
++        return
++      }
++      if (
++        verified.candidates.some(
++          (candidate) => candidate.route === 'antigravity-opus' && candidate.available
++        )
++      ) {
++        this.report(cut.sessionId, 'antigravityAdapterUnavailable')
++      }
++      const decision = decideQuotaFallback({
++        enabled: true,
++        provider: record.provider,
++        billing: verified.billing,
++        errorCode: cut.errorCode,
++        turnId: cut.turnItemId,
++        currentTurnId: cut.turnItemId,
++        settled: true,
++        pending: false,
++        candidates: verified.candidates.filter(
++          (candidate) => candidate.route !== 'antigravity-opus'
++        ),
++        now: this.now()
++      })
++      if (decision.kind === 'hold') {
++        this.report(cut.sessionId, decision.reason)
++        return
++      }
++      if (decision.route === 'antigravity-opus') {
++        this.report(cut.sessionId, 'crossProviderHandoffRequired')
++        return
++      }
++      const candidate = verified.candidates.find((item) => item.route === decision.route)
++      if (!candidate?.credit) {
++        return
++      }
++      const claimId = `quota-${createHash('sha256')
++        .update(JSON.stringify([this.deps.hostId, cut.sessionId, cut.turnItemId]))
++        .digest('hex')}`
++      const operationId = `${this.now()}-${claimId.slice(6, 38)}`
++      const reservation: NativeQuotaReservation = {
++        operationId,
++        claimId,
++        credentialRef: verified.credentialRef,
++        sessionId: cut.sessionId,
++        sourceTurnId: cut.turnItemId,
++        errorCode: cut.errorCode,
++        route: decision.route,
++        pool: verified.pool,
++        maxDebitUsd: candidate.credit.maxDebitUsd,
++        phase: 'reserved'
++      }
++      const fence = await host.quotaContinuation.reserve(cut, () => {
++        if (this.disposed) {
++          throw new Error('Quota controller stopped')
++        }
++        const claim = this.ledger.claim({
++          operationId: claimId,
++          sessionId: cut.sessionId,
++          route: decision.route,
++          pool: verified.pool,
++          maxDebitUsd: candidate.credit!.maxDebitUsd,
++          remainingUsd: candidate.credit!.remainingUsd
++        })
++        if (claim !== 'claimed') {
++          throw new Error('Quota continuation already claimed or budget unavailable')
++        }
++        this.reservations.write(reservation)
++      })
++      if (fence === null) {
++        this.report(cut.sessionId, 'sourceMovedOn')
++        return
++      }
++      if (this.disposed) {
++        throw new Error('Quota controller stopped')
++      }
++      this.active.add(cut.sessionId)
++      this.reservations.write({ ...reservation, phase: 'dispatching' })
++      this.ledger.settle(claimId, 'unknown')
++      this.subscriptions.set(
++        cut.sessionId,
++        host.observeJournalPublications(cut.sessionId, () => {
++          void this.observe(cut.sessionId)
++        })
++      )
++      const sent = await host.send(
++        { callerKey: QUOTA_CONTINUATION_CALLER },
++        structuredAgentSessionMessageSendMutation({
++          sessionId: cut.sessionId,
++          clientOperationId: operationId,
++          expectedRuntimeFence: fence,
++          usageLimitContinuationOfTurnItemId: cut.turnItemId,
++          body: {
++            kind: 'message',
++            role: 'user',
++            blocks: [
++              {
++                type: 'text',
++                text: 'Continue where you left off. Preserve existing approvals and do not repeat completed operations.'
++              }
++            ]
++          }
++        })
++      )
++      if (!sent.ok) {
++        await this.finish(cut.sessionId, reservation)
++        return
++      }
++      this.report(cut.sessionId, 'submitted')
++      await this.observe(cut.sessionId)
++    } catch {
++      const reservation = this.reservations.read(cut.sessionId)
++      if (reservation) {
++        this.reservations.write({ ...reservation, phase: 'unknown' })
++      }
++      this.active.delete(cut.sessionId)
++      this.report(cut.sessionId, 'unknown')
++    } finally {
++      this.preparing.delete(cut.sessionId)
++    }
++  }
++  readonly credentials = async (sessionId: string): Promise<NativeQuotaApiCredential | null> => {
++    const entry = this.reservations.read(sessionId)
++    if (!entry) {
++      return null
++    }
++    const config = this.deps.config
++    const record = this.deps.host()?.deps.store.getRecord(sessionId)
++    if (
++      !config?.enabled ||
++      !record ||
++      !this.active.has(sessionId) ||
++      entry.phase !== 'dispatching' ||
++      !this.deps.host()?.quotaContinuation.allowed(sessionId, entry.sourceTurnId)
++    ) {
++      throw new Error('Quota continuation ownership is unresolved')
++    }
++    return verifyNativeQuotaCredential(
++      config,
++      record,
++      entry,
++      () => this.now(),
++      () => {
++        const current = this.reservations.read(sessionId)
++        if (
++          !this.active.has(sessionId) ||
++          current?.operationId !== entry.operationId ||
++          current.phase !== 'dispatching' ||
++          !this.deps.host()?.quotaContinuation.allowed(sessionId, entry.sourceTurnId)
++        ) {
++          throw new Error('Quota continuation ownership changed')
++        }
++      }
++    )
++  }
++  private async observe(sessionId: string): Promise<void> {
++    if (this.observing.has(sessionId) || !this.active.has(sessionId)) {
++      return
++    }
++    this.observing.add(sessionId)
++    try {
++      const host = this.deps.host()
++      const reservation = this.reservations.read(sessionId)
++      if (!host || !reservation) {
++        return
++      }
++      const snapshot = await host.journalSnapshot(sessionId)
++      const submission = snapshot.submissions.find(
++        (value) => value.clientMessageId === reservation.operationId
++      )
++      if (
++        !submission ||
++        submission.dispatchState === 'pending' ||
++        submission.dispatchState === 'unknown'
++      ) {
++        return
++      }
++      const work = host.currentWork(sessionId)
++      if (!work || work.working() || work.owesAnySend() || work.hasActionablePrompt()) {
++        return
++      }
++      const latest = latestNativeChatTurnSinceRequest(snapshot.items, snapshot.submissions)
++      if (
++        submission.dispatchState === 'rejected' ||
++        (latest?.verdict && latest.turnItem.itemId !== reservation.sourceTurnId)
++      ) {
++        await this.finish(sessionId, reservation)
++      }
++    } catch {
++      this.report(sessionId, 'reconciliationPending')
++    } finally {
++      this.observing.delete(sessionId)
++    }
++  }
++  private async finish(sessionId: string, reservation: NativeQuotaReservation): Promise<void> {
++    const finished = await this.deps.host()?.quotaContinuation.finish(sessionId, () => {
++      this.reservations.write({ ...reservation, phase: 'completed' })
++      this.ledger.settle(reservation.claimId, 'completed')
++      this.active.delete(sessionId)
++    })
++    if (finished) {
++      this.subscriptions.get(sessionId)?.()
++      this.subscriptions.delete(sessionId)
++      this.report(sessionId, 'settled')
++    }
++  }
++  dispose(): void {
++    this.disposed = true
++    this.subscriptions.forEach((unsubscribe) => unsubscribe())
++    this.subscriptions.clear()
++    this.active.clear()
++  }
++}
+diff --git a/src/main/native-chat/quota-fallback-native-credential.ts b/src/main/native-chat/quota-fallback-native-credential.ts
+new file mode 100644
+index 0000000000..bb5646830b
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-native-credential.ts
+@@ -0,0 +1,67 @@
++import type { AgentSessionRecord } from '../../shared/agent-session-record'
++import type { NativeQuotaFallbackConfig } from './quota-fallback-native-config'
++import type { NativeQuotaReservation } from './quota-fallback-native-store'
++import type { NativeQuotaApiCredential } from './quota-fallback-native-auth'
++import type { ConfirmedQuotaCut } from './quota-fallback-journal-cut'
++import { decideQuotaFallback } from './quota-fallback-policy'
++
++export async function verifyNativeQuotaCredential(
++  config: NativeQuotaFallbackConfig,
++  record: AgentSessionRecord,
++  entry: NativeQuotaReservation,
++  now: () => number,
++  assertCurrent: () => void
++): Promise<NativeQuotaApiCredential> {
++  const cut: ConfirmedQuotaCut = {
++    sessionId: entry.sessionId,
++    turnItemId: entry.sourceTurnId,
++    errorCode: entry.errorCode
++  }
++  const verified = await config.verify({ record, cut })
++  const candidate = verified?.candidates.find((value) => value.route === entry.route)
++  if (
++    !verified?.maxDebitEnforced ||
++    verified.pool !== entry.pool ||
++    verified.credentialRef !== entry.credentialRef ||
++    !candidate?.credit ||
++    candidate.credit.maxDebitUsd !== entry.maxDebitUsd
++  ) {
++    throw new Error('Quota credit cap no longer verified')
++  }
++  const decision = decideQuotaFallback({
++    enabled: true,
++    provider: entry.route === 'claude-api' ? 'claude' : 'codex',
++    billing: verified.billing,
++    errorCode: entry.errorCode,
++    turnId: entry.sourceTurnId,
++    currentTurnId: entry.sourceTurnId,
++    settled: true,
++    pending: false,
++    candidates: [candidate],
++    now: now()
++  })
++  if (decision.kind !== 'switch' || decision.route !== entry.route) {
++    throw new Error('Quota credit is unavailable')
++  }
++  const apiKey = await config.readApiKey(entry.route, {
++    pool: entry.pool,
++    credentialRef: entry.credentialRef
++  })
++  assertCurrent()
++  const fresh = decideQuotaFallback({
++    enabled: true,
++    provider: entry.route === 'claude-api' ? 'claude' : 'codex',
++    billing: verified.billing,
++    errorCode: entry.errorCode,
++    turnId: entry.sourceTurnId,
++    currentTurnId: entry.sourceTurnId,
++    settled: true,
++    pending: false,
++    candidates: [candidate],
++    now: now()
++  })
++  if (fresh.kind !== 'switch' || fresh.route !== entry.route || !apiKey || /[\r\n]/.test(apiKey)) {
++    throw new Error('Quota API credential unavailable')
++  }
++  return { route: entry.route, apiKey, maxDebitUsd: entry.maxDebitUsd }
++}
+diff --git a/src/main/native-chat/quota-fallback-native-guard.ts b/src/main/native-chat/quota-fallback-native-guard.ts
+new file mode 100644
+index 0000000000..e0edab2d76
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-native-guard.ts
+@@ -0,0 +1,22 @@
++import { refuse } from '../../shared/agent-session-wire-refusals'
++import type { AgentSessionMutationEnvelope } from '../../shared/agent-session-wire'
++import type { StructuredAgentSessionHostDeps } from './agent-session-wire/structured-agent-session-host-types'
++
++/** Called inside the native serialization lane, before opening or mutating a child. */
++export function quotaContinuationRefusal(
++  deps: StructuredAgentSessionHostDeps,
++  callerKey: string,
++  envelope: AgentSessionMutationEnvelope
++) {
++  return deps.quotaFallbackSendAllowed?.(
++    envelope.sessionId,
++    envelope.clientOperationId,
++    callerKey
++  ) === false
++    ? refuse(
++        'agent_session_operation_invalid',
++        { reason: 'handoffInFlight' },
++        'A quota continuation owns this session. Wait for it to settle.'
++      )
++    : null
++}
+diff --git a/src/main/native-chat/quota-fallback-native-launch.test.ts b/src/main/native-chat/quota-fallback-native-launch.test.ts
+new file mode 100644
+index 0000000000..9bb79508cf
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-native-launch.test.ts
+@@ -0,0 +1,107 @@
++import { expect, it, vi } from 'vitest'
++import { agentSessionRecordFixture } from './agent-session-record-test-fixture'
++import {
++  createClaudeStructuredLaunchResolver,
++  createCodexStructuredLaunchResolver
++} from '../runtime/structured-agent-launch-composition.test-support'
++import {
++  claudeProviderHandle,
++  codexProviderHandle
++} from '../../shared/agent-session-provider-handle-encoding'
++import { quotaApiEnvironment } from './quota-fallback-native-auth'
++
++const identity = {
++  sessionId: 'quota-session',
++  workspaceId: 'workspace-1',
++  hostId: 'local',
++  agent: 'claude' as const,
++  providerHandle: null
++}
++it('keeps Claude transcript home and permission context while selecting isolated API auth', async () => {
++  const handle = claudeProviderHandle('12345678-1234-1234-1234-123456789012', null)
++  const record = agentSessionRecordFixture({
++    sessionId: identity.sessionId,
++    accountHome: { variable: 'CLAUDE_CONFIG_DIR', path: '/tmp/quota-test-home/.claude' },
++    providerHandleChain: [
++      { linkId: 'link', handle, origin: 'created', mintedAtFence: 1, observedAt: 1 }
++    ]
++  })
++  const inherited = {
++    PATH: '/usr/bin',
++    CLAUDE_CONFIG_DIR: '/tmp/quota-test-home/.claude',
++    CLAUDE_CODE_OAUTH_TOKEN: 'fake-oauth',
++    ANTHROPIC_BASE_URL: 'https://invalid.example'
++  }
++  const resolve = createClaudeStructuredLaunchResolver({
++    store: { getRecord: () => record, pinLaunchDirectory: vi.fn() },
++    resolveWorkspacePath: async () => '/repo',
++    resolveCommand: () => '/usr/bin/claude',
++    resolveAuthPolicy: () => ({ account: 'system' }),
++    resolveInheritedEnv: async () => inherited,
++    hasTranscript: async () => true,
++    resolveLaunchArgs: () => [],
++    resolveQuotaApiCredential: async () => ({
++      route: 'claude-api',
++      apiKey: 'fake-key',
++      maxDebitUsd: 1
++    })
++  })
++  const launch = await resolve({
++    identity: { ...identity, providerHandle: handle },
++    permissionMode: 'ask'
++  })
++  expect(launch.options.resume).toBe(handle.nativeId)
++  expect(launch.options.extraArgs).toMatchObject({ 'max-budget-usd': '1' })
++  expect(launch.claudeConfigDir).toBe('/tmp/quota-test-home/.claude')
++  expect(launch.env).toMatchObject({ ANTHROPIC_API_KEY: 'fake-key' })
++  expect(launch.env).not.toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN')
++  expect(launch.env).not.toHaveProperty('ANTHROPIC_BASE_URL')
++  expect(inherited.CLAUDE_CODE_OAUTH_TOKEN).toBe('fake-oauth')
++})
++it('resumes the same Codex thread with a keyed API provider, then explicitly restores subscription routing', async () => {
++  const handle = codexProviderHandle('019fd532-7c11-7a90-b6de-4e1a2c3d5f60')
++  const record = agentSessionRecordFixture({
++    sessionId: identity.sessionId,
++    provider: 'codex',
++    accountHome: { variable: 'CODEX_HOME', path: '/tmp/quota-test-home/.codex' },
++    providerHandleChain: [
++      { linkId: 'link', handle, origin: 'created', mintedAtFence: 1, observedAt: 1 }
++    ]
++  })
++  let api = true
++  const resolve = createCodexStructuredLaunchResolver({
++    store: { getRecord: () => record, pinLaunchDirectory: vi.fn() },
++    resolveWorkspacePath: async () => '/repo',
++    resolveCommand: () => '/usr/bin/codex',
++    resolveLaunchArgs: () => [],
++    resolveEnvironment: async () => ({ OPENAI_API_KEY: 'fake-old' }),
++    resolveQuotaApiCredential: async () =>
++      api ? { route: 'openai-api', apiKey: 'fake-key', maxDebitUsd: 1 } : null,
++    restoreQuotaOpenaiSubscription: () => !api
++  })
++  const launch = await resolve({
++    identity: { ...identity, agent: 'codex', providerHandle: handle }
++  })
++  expect(launch.resumeThreadId).toBe(handle.nativeId)
++  expect(launch.codexHome).toBe('/tmp/quota-test-home/.codex')
++  expect(launch.modelProvider).toBe('orca_quota_api')
++  expect(launch.args).toContain('model_providers.orca_quota_api.requires_openai_auth=false')
++  expect(launch.args.join(' ')).not.toContain('fake-key')
++  expect(launch.env).toMatchObject({ ORCA_QUOTA_API_KEY: 'fake-key' })
++  expect(launch.env).not.toHaveProperty('OPENAI_API_KEY')
++  api = false
++  const restored = await resolve({
++    identity: { ...identity, agent: 'codex', providerHandle: handle }
++  })
++  expect(restored.modelProvider).toBe('openai')
++  expect(restored.args).toContain('model_provider="openai"')
++  expect(restored.env).not.toHaveProperty('ORCA_QUOTA_API_KEY')
++})
++it('rejects multiline credentials without rejecting ordinary key letters', () => {
++  expect(() =>
++    quotaApiEnvironment({}, { route: 'claude-api', apiKey: 'contains-r-and-n', maxDebitUsd: 1 })
++  ).not.toThrow()
++  expect(() =>
++    quotaApiEnvironment({}, { route: 'claude-api', apiKey: 'fake\nkey', maxDebitUsd: 1 })
++  ).toThrow()
++})
+diff --git a/src/main/native-chat/quota-fallback-native-lease.ts b/src/main/native-chat/quota-fallback-native-lease.ts
+new file mode 100644
+index 0000000000..cf4ca55ca0
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-native-lease.ts
+@@ -0,0 +1,111 @@
++import { readAgentJournalTurn } from '../../shared/agent-session-turn-record'
++import type { StructuredAgentSessionHost } from './agent-session-wire/structured-agent-session-host'
++import { confirmedQuotaCut, type ConfirmedQuotaCut } from './quota-fallback-journal-cut'
++import type {
++  StructuredAgentSessionHostDeps,
++  StructuredAgentSessionHostSession
++} from './agent-session-wire/structured-agent-session-host-types'
++import type { StructuredAgentSessionCurrentWork } from './agent-session-wire/structured-agent-session-current-work'
++
++type NativeQuotaLeaseContext = {
++  deps: StructuredAgentSessionHostDeps
++  sessions: ReadonlyMap<string, StructuredAgentSessionHostSession>
++  serialize<T>(sessionId: string, run: () => Promise<T>): Promise<T>
++  work(sessionId: string): StructuredAgentSessionCurrentWork | null
++  childrenPending(sessionId: string): boolean
++  stop(sessionId: string): Promise<void>
++  wake(sessionId: string): void
++}
++export function createNativeQuotaLease(context: () => NativeQuotaLeaseContext) {
++  function allowed(sessionId: string, sourceTurnId: string): boolean {
++    const session = context().sessions.get(sessionId)
++    if (!session) {
++      return false
++    }
++    const journal = session.journal
++    const turn = journal.snapshot().items.find((item) => item.itemId === sourceTurnId)
++    const turnId = turn ? readAgentJournalTurn(turn.body)?.turnId : null
++    return (
++      journal.queuedMessages.userStopInForce() === null &&
++      !journal.stopMarks.personStopDecides(turnId ?? null) &&
++      !journal.stopMarks.personStopDecides(null)
++    )
++  }
++  return {
++    allowed,
++    reserve: (cut: ConfirmedQuotaCut, reserve: () => void) => {
++      const ctx = context()
++      return ctx.serialize(cut.sessionId, async () => {
++        const session = ctx.sessions.get(cut.sessionId)
++        const record = ctx.deps.store.getRecord(cut.sessionId)
++        const work = ctx.work(cut.sessionId)
++        if (
++          !allowed(cut.sessionId, cut.turnItemId) ||
++          !session ||
++          !record ||
++          !work ||
++          work.working() ||
++          work.owesAnySend() ||
++          work.hasActionablePrompt() ||
++          ctx.childrenPending(cut.sessionId) ||
++          record.conversationCommand ||
++          record.lease.unreconciled ||
++          record.lease.claimStatus === 'conflicted'
++        ) {
++          return null
++        }
++        const snapshot = session.journal.snapshot()
++        const current = confirmedQuotaCut(cut.sessionId, snapshot.items, snapshot.submissions)
++        if (
++          !current ||
++          current.turnItemId !== cut.turnItemId ||
++          current.errorCode !== cut.errorCode
++        ) {
++          return null
++        }
++        await ctx.deps.assertNoTerminalWriter?.(record)
++        if (!allowed(cut.sessionId, cut.turnItemId)) {
++          return null
++        }
++        reserve()
++        await ctx.stop(cut.sessionId)
++        return ctx.deps.store.getConversation(cut.sessionId)?.currentFence ?? null
++      })
++    },
++    finish: (sessionId: string, finish: () => void) => {
++      const ctx = context()
++      return ctx.serialize(sessionId, async () => {
++        const work = ctx.work(sessionId)
++        if (
++          !work ||
++          work.working() ||
++          work.owesAnySend() ||
++          work.hasActionablePrompt() ||
++          ctx.childrenPending(sessionId)
++        ) {
++          return false
++        }
++        await ctx.stop(sessionId)
++        finish()
++        ctx.wake(sessionId)
++        return true
++      })
++    }
++  }
++}
++
++export function nativeQuotaLeaseForHost(host: StructuredAgentSessionHost) {
++  return createNativeQuotaLease(() => {
++    const ports = host.collaboratorsForTests()
++    return {
++      deps: host.deps,
++      sessions: ports.sessions,
++      serialize: ports.serialize,
++      work: host.currentWork,
++      childrenPending: (id) =>
++        ports.clientDelivery.childWorkIncomplete(id) || ports.clientDelivery.childWorkOpen(id),
++      stop: (id) => ports.lifetime.stopAgent(id, { cause: 'evict', resting: true }),
++      wake: (id) => ports.conversationDelivery.loop.wake(id)
++    }
++  })
++}
+diff --git a/src/main/native-chat/quota-fallback-native-store.ts b/src/main/native-chat/quota-fallback-native-store.ts
+new file mode 100644
+index 0000000000..11001f3b89
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-native-store.ts
+@@ -0,0 +1,70 @@
++import {
++  closeSync,
++  fsyncSync,
++  mkdirSync,
++  openSync,
++  readFileSync,
++  renameSync,
++  writeFileSync
++} from 'node:fs'
++import { join } from 'node:path'
++import { z } from 'zod'
++
++const Reservation = z.object({
++  operationId: z.string().min(1),
++  claimId: z.string().min(1),
++  credentialRef: z.string().min(1),
++  sessionId: z.string().min(1),
++  sourceTurnId: z.string().min(1),
++  errorCode: z.enum(['usage_limit_reached', 'usageLimitExceeded']),
++  route: z.enum(['claude-api', 'openai-api']),
++  pool: z.string().min(1),
++  maxDebitUsd: z.number().finite().positive(),
++  phase: z.enum(['reserved', 'dispatching', 'completed', 'unknown'])
++})
++const Reservations = z.record(z.string(), Reservation)
++export type NativeQuotaReservation = z.infer<typeof Reservation>
++
++/** One native runtime owns this directory; a restart retains every unresolved reservation. */
++export class NativeQuotaReservationStore {
++  private state: z.infer<typeof Reservations>
++  private readonly file: string
++  constructor(private readonly directory: string) {
++    mkdirSync(directory, { recursive: true, mode: 0o700 })
++    this.file = join(directory, 'native-reservations.json')
++    try {
++      this.state = Reservations.parse(JSON.parse(readFileSync(this.file, 'utf8')))
++    } catch (error) {
++      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') {
++        throw error
++      }
++      this.state = {}
++    }
++  }
++  completedOpenai(sessionId: string): boolean {
++    const entry = this.state[sessionId]
++    return entry?.phase === 'completed' && entry.route === 'openai-api'
++  }
++  read(sessionId: string): NativeQuotaReservation | null {
++    const entry = this.state[sessionId]
++    return entry && entry.phase !== 'completed' ? { ...entry } : null
++  }
++  write(entry: NativeQuotaReservation): void {
++    const parsed = Reservation.parse(entry)
++    const existing = this.read(entry.sessionId)
++    if (existing && existing.operationId !== entry.operationId) {
++      throw new Error('Continuation already reserved')
++    }
++    const next = { ...this.state, [entry.sessionId]: parsed }
++    const temporary = `${this.file}.tmp`
++    writeFileSync(temporary, JSON.stringify(next), { mode: 0o600, flush: true })
++    renameSync(temporary, this.file)
++    const directory = openSync(this.directory, 'r')
++    try {
++      fsyncSync(directory)
++    } finally {
++      closeSync(directory)
++    }
++    this.state = next
++  }
++}
+diff --git a/src/main/native-chat/quota-fallback-native.test.ts b/src/main/native-chat/quota-fallback-native.test.ts
+new file mode 100644
+index 0000000000..105c378586
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-native.test.ts
+@@ -0,0 +1,228 @@
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++import { agentJournalItemKey } from '../../shared/agent-session-journal-item-key'
++import { agentSessionFailureWords } from '../../shared/agent-session-failure-words'
++import { NativeQuotaContinuationController } from './quota-fallback-native-controller'
++import type { NativeQuotaFallbackConfig } from './quota-fallback-native-config'
++import { confirmedQuotaCut } from './quota-fallback-journal-cut'
++import {
++  createQueuedMessageTestRig,
++  eventually,
++  type QueuedMessageTestRig
++} from './agent-session-wire/structured-agent-session-queued-message-rig.test-fixture'
++import {
++  HOST_TEST_SESSION as SESSION,
++  HOST_TEST_NOW as NOW
++} from './agent-session-wire/structured-agent-session-host-test-data'
++
++let rig: QueuedMessageTestRig
++let controller: NativeQuotaContinuationController
++let now: number
++let config: NativeQuotaFallbackConfig
++beforeEach(async () => {
++  rig = await createQueuedMessageTestRig({ restartable: true })
++  now = NOW
++  config = {
++    enabled: true,
++    verify: vi.fn<NativeQuotaFallbackConfig['verify']>(async () => ({
++      billing: 'subscription',
++      pool: 'test-pool',
++      credentialRef: 'test-key-ref',
++      maxDebitEnforced: true,
++      candidates: [
++        {
++          route: 'openai-api',
++          available: true,
++          modelCompatible: true,
++          observedAt: NOW,
++          credit: {
++            remainingUsd: 10,
++            maxDebitUsd: 1,
++            paidOverflowBlocked: true,
++            expiresAt: NOW + 120_000
++          }
++        }
++      ]
++    })),
++    readApiKey: vi.fn(async () => 'fake-key'),
++    report: vi.fn()
++  }
++  controller = makeController()
++  rig.host.deps.quotaFallbackSendAllowed = controller.sendAllowed
++  rig.host.deps.quotaFallbackDeliveryAllowed = controller.deliveryAllowed
++})
++afterEach(async () => {
++  controller.dispose()
++  await rig.dispose()
++})
++function makeController() {
++  return new NativeQuotaContinuationController({
++    stateDirectory: rig.root,
++    hostId: 'test-host',
++    host: () => rig.host,
++    config,
++    now: () => now
++  })
++}
++async function quotaCut() {
++  const journal = rig.host.collaboratorsForTests().sessions.get(SESSION)!.journal
++  const identity = { provider: 'orca' as const, clientMessageId: 'limited' }
++  const turnItemId = agentJournalItemKey(identity)
++  await journal.appendItem(
++    identity,
++    {
++      kind: 'turn',
++      turnId: 'limited',
++      state: 'completed',
++      outcome: 'failure',
++      startedAt: NOW,
++      completedAt: NOW
++    },
++    { fence: 1, turnScope: { kind: 'thread' } }
++  )
++  await journal.appendItem(
++    { provider: 'orca', clientMessageId: 'limited-failure' },
++    {
++      kind: 'status',
++      ...agentSessionFailureWords(
++        { kind: 'usageLimitReached', usageLimit: { providerCode: 'usageLimitExceeded' } },
++        { surface: 'row' }
++      )
++    },
++    { fence: 1, turnScope: { kind: 'turn', turnItemId } }
++  )
++  const snapshot = journal.snapshot()
++  const cut = confirmedQuotaCut(SESSION, snapshot.items, snapshot.submissions)
++  expect(cut).not.toBeNull()
++  return cut!
++}
++it('reserves native ownership, submits once, binds API account, and fences restart replay', async () => {
++  const cut = await quotaCut()
++  await controller.onCut(cut)
++  expect(config.report).toHaveBeenCalledWith(SESSION, 'submitted')
++  await eventually(() => expect(rig.dispatch).toHaveBeenCalledTimes(1))
++  expect(await controller.credentials(SESSION)).toMatchObject({
++    route: 'openai-api',
++    apiKey: 'fake-key'
++  })
++  expect(config.readApiKey).toHaveBeenCalledWith('openai-api', {
++    pool: 'test-pool',
++    credentialRef: 'test-key-ref'
++  })
++  expect((await rig.send('concurrent user work').result).ok).toBe(false)
++  await controller.onCut(cut)
++  expect(rig.dispatch).toHaveBeenCalledTimes(1)
++  controller.dispose()
++  controller = makeController()
++  expect(controller.sendAllowed(SESSION, 'new', 'client')).toBe(false)
++  await expect(controller.credentials(SESSION)).rejects.toThrow('ownership')
++  await controller.onCut(cut)
++  expect(rig.dispatch).toHaveBeenCalledTimes(1)
++})
++it('honors personal Stop while credit verification is pending', async () => {
++  const cut = await quotaCut()
++  const verify = config.verify
++  config.verify = async (input) => {
++    await rig.stop()
++    return verify(input)
++  }
++  await controller.onCut(cut)
++  expect(config.report).toHaveBeenCalledWith(SESSION, 'sourceMovedOn')
++  expect(rig.dispatch).not.toHaveBeenCalled()
++})
++it('rechecks expiry and personal Stop after asynchronous secret retrieval', async () => {
++  await controller.onCut(await quotaCut())
++  config.readApiKey = async () => {
++    now += 60_001
++    return 'fake-key'
++  }
++  await expect(controller.credentials(SESSION)).rejects.toThrow('credential')
++  now = NOW
++  config.readApiKey = async () => {
++    await rig.stop()
++    return 'fake-key'
++  }
++  await expect(controller.credentials(SESSION)).rejects.toThrow('ownership')
++})
++it('requires an enforced budget and exact account binding', async () => {
++  const cut = await quotaCut()
++  const verify = config.verify
++  config.verify = async (input) => ({ ...(await verify(input))!, maxDebitEnforced: false })
++  await controller.onCut(cut)
++  expect(rig.dispatch).not.toHaveBeenCalled()
++  config.verify = verify
++  await controller.onCut(cut)
++  config.verify = async (input) => ({ ...(await verify(input))!, credentialRef: 'other-key' })
++  await expect(controller.credentials(SESSION)).rejects.toThrow('cap')
++  expect(config.readApiKey).not.toHaveBeenCalled()
++})
++it('releases the source only after the native continuation settles and its child closes', async () => {
++  await controller.onCut(await quotaCut())
++  await eventually(() => expect(rig.dispatch).toHaveBeenCalledTimes(1))
++  const snapshot = await rig.host.journalSnapshot(SESSION)
++  const id = snapshot.submissions[0]!.clientMessageId
++  await rig.settleAccepted(id, 'api-result')
++  const journal = rig.host.collaboratorsForTests().sessions.get(SESSION)!.journal
++  await journal.appendItem(
++    { provider: 'orca', clientMessageId: 'api-result' },
++    {
++      kind: 'turn',
++      turnId: 'turn-api-result',
++      state: 'completed',
++      outcome: 'success',
++      startedAt: NOW,
++      completedAt: NOW
++    },
++    { fence: rig.store.getRecord(SESSION)!.lease.runtimeFence, turnScope: { kind: 'thread' } }
++  )
++  await eventually(() => expect(config.report).toHaveBeenCalledWith(SESSION, 'settled'))
++  expect(controller.sendAllowed(SESSION, 'new', 'client')).toBe(true)
++  expect(controller.restoreOpenaiSubscription(SESSION)).toBe(true)
++  expect(await controller.credentials(SESSION)).toBeNull()
++  expect(rig.host.collaboratorsForTests().sessions.get(SESSION)?.child).toBeNull()
++})
++
++it('skips an unsupported Antigravity adapter instead of trapping the API fallback', async () => {
++  const verify = config.verify
++  config.verify = async (input) => {
++    const proof = (await verify(input))!
++    return {
++      ...proof,
++      candidates: [
++        {
++          route: 'antigravity-opus',
++          observedAt: NOW,
++          available: true,
++          modelCompatible: true,
++          fiveHourRemaining: 1,
++          weeklyRemaining: 1
++        },
++        ...proof.candidates
++      ]
++    }
++  }
++  await controller.onCut(await quotaCut())
++  expect(config.report).toHaveBeenCalledWith(SESSION, 'antigravityAdapterUnavailable')
++  expect(config.report).toHaveBeenCalledWith(SESSION, 'submitted')
++})
++it.each(['clear', 'compact', 'rewind'] as const)(
++  'rejects %s while the native fallback owns the source',
++  async (command) => {
++    await controller.onCut(await quotaCut())
++    const operationId = `${NOW}-0123456789abcdef0123456789abcdef`
++    const fields =
++      command === 'rewind' ? { itemId: 'source', expectedEpoch: 'epoch-1' } : { command }
++    const envelope = rig.envelope(
++      fields,
++      command === 'rewind' ? 'agentSession.rewind' : 'agentSession.conversationCommand',
++      operationId
++    )
++    const reply =
++      command === 'rewind'
++        ? await rig.host.rewind(
++            { callerKey: 'client' },
++            { envelope, itemId: 'source', expectedEpoch: 'epoch-1' }
++          )
++        : await rig.host.conversationCommand({ callerKey: 'client' }, { envelope, command })
++    expect(reply).toMatchObject({ ok: false, refusal: { details: { reason: 'handoffInFlight' } } })
++  }
++)
+diff --git a/src/main/native-chat/quota-fallback-policy.test.ts b/src/main/native-chat/quota-fallback-policy.test.ts
+new file mode 100644
+index 0000000000..352fc7b161
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-policy.test.ts
+@@ -0,0 +1,132 @@
++import { describe, expect, it } from 'vitest'
++import {
++  decideQuotaFallback,
++  type QuotaFallbackInput,
++  type QuotaFallbackCandidate
++} from './quota-fallback-policy'
++
++const now = 1_000_000
++const ag: QuotaFallbackCandidate = {
++  route: 'antigravity-opus',
++  observedAt: now,
++  available: true,
++  modelCompatible: true,
++  fiveHourRemaining: 50,
++  weeklyRemaining: 50
++}
++const api: QuotaFallbackCandidate = {
++  route: 'claude-api',
++  observedAt: now,
++  available: true,
++  modelCompatible: true,
++  credit: { remainingUsd: 10, maxDebitUsd: 1, expiresAt: now + 60_000, paidOverflowBlocked: true }
++}
++function input(overrides: Partial<QuotaFallbackInput> = {}): QuotaFallbackInput {
++  return {
++    enabled: true,
++    provider: 'claude',
++    billing: 'subscription',
++    errorCode: 'usage_limit_reached',
++    turnId: 'turn-1',
++    currentTurnId: 'turn-1',
++    settled: true,
++    pending: false,
++    candidates: [api, ag],
++    now,
++    ...overrides
++  }
++}
++
++describe('confirmed subscription quota fallback', () => {
++  it('prefers AG independently of candidate ordering', () => {
++    expect(decideQuotaFallback(input())).toEqual({ kind: 'switch', route: 'antigravity-opus' })
++  })
++  it('uses verified Claude API when either AG window is exhausted', () => {
++    for (const window of ['fiveHourRemaining', 'weeklyRemaining']) {
++      expect(decideQuotaFallback(input({ candidates: [{ ...ag, [window]: 0 }, api] }))).toEqual({
++        kind: 'switch',
++        route: 'claude-api'
++      })
++    }
++  })
++  it('routes Codex exclusively to OpenAI API', () => {
++    expect(
++      decideQuotaFallback(
++        input({
++          provider: 'codex',
++          errorCode: 'usageLimitExceeded',
++          candidates: [ag, api, { ...api, route: 'openai-api' }]
++        })
++      )
++    ).toEqual({ kind: 'switch', route: 'openai-api' })
++  })
++  it.each([
++    '429',
++    'rate_limit',
++    'rateLimitExceeded',
++    'timeout',
++    'authentication_error',
++    '',
++    'insufficient_quota'
++  ])('does not switch for ambiguous or different error %s', (errorCode) => {
++    expect(decideQuotaFallback(input({ errorCode })).kind).toBe('hold')
++  })
++  it.each([
++    { enabled: false },
++    { billing: 'api' as const },
++    { settled: false },
++    { pending: true },
++    { currentTurnId: 'new-turn' },
++    { turnId: '' },
++    { now: Number.NaN }
++  ])('holds unsafe source state %j', (overrides) => {
++    expect(decideQuotaFallback(input(overrides)).kind).toBe('hold')
++  })
++  it.each([now - 60_001, now + 1, Number.NaN, Number.POSITIVE_INFINITY])(
++    'rejects stale or invalid observations %s',
++    (observedAt) => {
++      expect(decideQuotaFallback(input({ candidates: [{ ...api, observedAt }] })).kind).toBe('hold')
++    }
++  )
++  it.each([
++    { remainingUsd: 0 },
++    { remainingUsd: Number.NaN },
++    { maxDebitUsd: 11 },
++    { maxDebitUsd: 0 },
++    { maxDebitUsd: Number.POSITIVE_INFINITY },
++    { expiresAt: now },
++    { paidOverflowBlocked: false }
++  ])('requires bounded free credit %j', (credit) => {
++    expect(
++      decideQuotaFallback(
++        input({
++          candidates: [
++            {
++              ...api,
++              credit: {
++                remainingUsd: 10,
++                maxDebitUsd: 1,
++                expiresAt: now + 60_000,
++                paidOverflowBlocked: true,
++                ...credit
++              }
++            }
++          ]
++        })
++      ).kind
++    ).toBe('hold')
++  })
++  it('does not infer credit evidence from authenticated API access', () => {
++    expect(decideQuotaFallback(input({ candidates: [{ ...api, credit: undefined }] })).kind).toBe(
++      'hold'
++    )
++  })
++  it('does not replace an exact model with an incompatible model', () => {
++    expect(
++      decideQuotaFallback(input({ candidates: [{ ...ag, modelCompatible: false }] })).kind
++    ).toBe('hold')
++  })
++  it('rejects conflicting duplicate observations for a route', () => {
++    expect(decideQuotaFallback(input({ candidates: [api, api] })).kind).toBe('hold')
++  })
++})
+diff --git a/src/main/native-chat/quota-fallback-policy.ts b/src/main/native-chat/quota-fallback-policy.ts
+new file mode 100644
+index 0000000000..cea8aa3789
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-policy.ts
+@@ -0,0 +1,96 @@
++export type QuotaFallbackRoute = 'antigravity-opus' | 'claude-api' | 'openai-api'
++
++export type QuotaFallbackCandidate = {
++  route: QuotaFallbackRoute
++  observedAt: number
++  available: boolean
++  modelCompatible: boolean
++  fiveHourRemaining?: number
++  weeklyRemaining?: number
++  credit?: {
++    remainingUsd: number
++    maxDebitUsd: number
++    expiresAt: number
++    paidOverflowBlocked: boolean
++  }
++}
++
++export type QuotaFallbackInput = {
++  enabled: boolean
++  provider: 'claude' | 'codex'
++  billing: 'subscription' | 'api'
++  errorCode: string
++  turnId: string
++  currentTurnId: string
++  settled: boolean
++  pending: boolean
++  candidates: readonly QuotaFallbackCandidate[]
++  now: number
++}
++
++export type QuotaFallbackDecision =
++  | { kind: 'switch'; route: QuotaFallbackRoute }
++  | { kind: 'hold'; reason: string }
++
++const ROUTES: Record<QuotaFallbackInput['provider'], readonly QuotaFallbackRoute[]> = {
++  claude: ['antigravity-opus', 'claude-api'],
++  codex: ['openai-api']
++}
++
++function positive(value: number | undefined): value is number {
++  return typeof value === 'number' && Number.isFinite(value) && value > 0
++}
++
++function usable(candidate: QuotaFallbackCandidate, now: number): boolean {
++  if (
++    !candidate.available ||
++    !candidate.modelCompatible ||
++    !Number.isFinite(candidate.observedAt) ||
++    candidate.observedAt > now ||
++    now - candidate.observedAt > 60_000
++  ) {
++    return false
++  }
++  if (candidate.route === 'antigravity-opus') {
++    return positive(candidate.fiveHourRemaining) && positive(candidate.weeklyRemaining)
++  }
++  const credit = candidate.credit
++  return Boolean(
++    credit &&
++    credit.paidOverflowBlocked &&
++    positive(credit.remainingUsd) &&
++    positive(credit.maxDebitUsd) &&
++    credit.maxDebitUsd <= credit.remainingUsd &&
++    Number.isFinite(credit.expiresAt) &&
++    credit.expiresAt > now
++  )
++}
++
++export function decideQuotaFallback(input: QuotaFallbackInput): QuotaFallbackDecision {
++  if (!input.enabled) {
++    return { kind: 'hold', reason: 'disabled' }
++  }
++  if (!Number.isFinite(input.now)) {
++    return { kind: 'hold', reason: 'invalidClock' }
++  }
++  if (input.billing !== 'subscription') {
++    return { kind: 'hold', reason: 'notSubscription' }
++  }
++  const expectedCode = input.provider === 'claude' ? 'usage_limit_reached' : 'usageLimitExceeded'
++  if (input.errorCode !== expectedCode) {
++    return { kind: 'hold', reason: 'quotaUnconfirmed' }
++  }
++  if (!input.turnId || input.turnId !== input.currentTurnId) {
++    return { kind: 'hold', reason: 'turnSuperseded' }
++  }
++  if (!input.settled || input.pending) {
++    return { kind: 'hold', reason: 'workUnsettled' }
++  }
++  for (const route of ROUTES[input.provider]) {
++    const matches = input.candidates.filter((candidate) => candidate.route === route)
++    if (matches.length === 1 && usable(matches[0], input.now)) {
++      return { kind: 'switch', route }
++    }
++  }
++  return { kind: 'hold', reason: 'noVerifiedRoute' }
++}
+diff --git a/src/main/runtime/structured-agent-runtime-registration-types.ts b/src/main/runtime/structured-agent-runtime-registration-types.ts
+index 2ce11db9bc..f2509b04ec 100644
+--- a/src/main/runtime/structured-agent-runtime-registration-types.ts
++++ b/src/main/runtime/structured-agent-runtime-registration-types.ts
+@@ -1,3 +1,4 @@
++import type { NativeQuotaApiCredential } from '../native-chat/quota-fallback-native-auth'
+ import type { AgentSessionExecutionLocation } from '../../shared/agent-session-record'
+ import type { AgentSessionAccountHome } from '../../shared/agent-session-account-home'
+ import type { applyStructuredCodexWorkspaceTrust } from '../agent-workspace-trust-spawn'
+@@ -22,6 +23,8 @@ import type {
+ 
+ /** What an agent's adapter is built from: the open store and the runtime around it. */
+ export type StructuredAgentAdapterContext = {
++  restoreQuotaOpenaiSubscription?: (sessionId: string) => boolean
++  resolveQuotaApiCredential?: (sessionId: string) => Promise<NativeQuotaApiCredential | null>
+   deps: StructuredAgentSessionRuntimeDeps
+   store: AgentSessionRecordStore
+   journalDatabase: JournalHostDatabase
+diff --git a/src/main/runtime/structured-agent-runtime-registrations.ts b/src/main/runtime/structured-agent-runtime-registrations.ts
+index ad074783d6..80ab157e38 100644
+--- a/src/main/runtime/structured-agent-runtime-registrations.ts
++++ b/src/main/runtime/structured-agent-runtime-registrations.ts
+@@ -67,6 +67,8 @@ function createCodexAdapter(context: StructuredAgentAdapterContext): StructuredA
+         structuredAgentLaunchSources(context),
+         codexStructuredLaunchPart({
+           resolveLaunchArgs: () => deps.resolveLaunchArgs('codex'),
++          resolveQuotaApiCredential: context.resolveQuotaApiCredential,
++          restoreQuotaOpenaiSubscription: context.restoreQuotaOpenaiSubscription,
+           ...(deps.resolveCodexCommand ? { resolveCommand: deps.resolveCodexCommand } : {})
+         })
+       ),
+@@ -114,6 +116,7 @@ function createClaudeAdapter(
+       structuredAgentLaunchSources(context),
+       claudeStructuredLaunchPart({
+         resolveLaunchArgs: () => deps.resolveLaunchArgs('claude'),
++        resolveQuotaApiCredential: context.resolveQuotaApiCredential,
+         ...(deps.resolveClaudeCommand ? { resolveCommand: deps.resolveClaudeCommand } : {}),
+         resolveAuthPolicy: deps.resolveClaudeAuthPolicy,
+         attachmentDirectory: agentSessionAttachmentStoreRoot(deps.stateDirectory),
+diff --git a/src/main/runtime/structured-agent-session-host-assembly.ts b/src/main/runtime/structured-agent-session-host-assembly.ts
+index c0b4e8f2d0..0e46e8733d 100644
+--- a/src/main/runtime/structured-agent-session-host-assembly.ts
++++ b/src/main/runtime/structured-agent-session-host-assembly.ts
+@@ -1,3 +1,4 @@
++import { NativeQuotaContinuationController } from '../native-chat/quota-fallback-native-controller'
+ // Loaded on first host install: the host, router and every provider adapter stay out of startup.
+ 
+ import { bindAtRestCommandContexts } from '../native-chat/agent-session-wire/at-rest-command-context'
+@@ -28,6 +29,12 @@ export async function installOnJournal(
+ ): Promise<InstalledRuntime> {
+   const envResolvers = createStructuredAgentEnvironmentResolvers(deps)
+   let host: StructuredAgentSessionHost | null = null
++  const quotaFallback = new NativeQuotaContinuationController({
++    stateDirectory: deps.stateDirectory,
++    hostId: deps.hostId,
++    host: () => host,
++    config: deps.quotaFallback
++  })
+   const lifecycle = createStructuredAgentSessionLifecycleDelivery({
+     handle: (event) => host?.handleAdapterEvent(event),
+     logger: deps.logger,
+@@ -39,6 +46,8 @@ export async function installOnJournal(
+     }
+   })
+   const context: StructuredAgentAdapterContext = {
++    resolveQuotaApiCredential: quotaFallback.credentials,
++    restoreQuotaOpenaiSubscription: quotaFallback.restoreOpenaiSubscription,
+     deps,
+     store,
+     journalDatabase,
+@@ -69,6 +78,9 @@ export async function installOnJournal(
+     resolveWorkspacePath: deps.resolveWorkspacePath,
+     logger: deps.logger,
+     ...(deps.onRequestFailure ? { onRequestFailure: deps.onRequestFailure } : {}),
++    onConfirmedQuotaCut: quotaFallback.onCut,
++    quotaFallbackSendAllowed: quotaFallback.sendAllowed,
++    quotaFallbackDeliveryAllowed: quotaFallback.deliveryAllowed,
+     ...(deps.onSessionStatusChanged ? { onSessionStatusChanged: deps.onSessionStatusChanged } : {}),
+     ...(deps.statusSink ? { statusSink: deps.statusSink } : {}),
+     ...(deps.conversationNaming ? { conversationNaming: deps.conversationNaming } : {}),
+@@ -132,6 +144,7 @@ export async function installOnJournal(
+     journalDatabase,
+     waitForRecovery: lifecycle.drain,
+     stopBackgroundWork: () => {
++      quotaFallback.dispose()
+       stopCommands()
+       stopVisualsSweep?.()
+       modelCatalog?.stop()
+diff --git a/src/main/runtime/structured-agent-session-runtime.ts b/src/main/runtime/structured-agent-session-runtime.ts
+index 46906ee3db..c8db55f475 100644
+--- a/src/main/runtime/structured-agent-session-runtime.ts
++++ b/src/main/runtime/structured-agent-session-runtime.ts
+@@ -1,3 +1,4 @@
++import type { NativeQuotaFallbackConfig } from '../native-chat/quota-fallback-native-config'
+ // Install lazily after Electron finalizes the profile path; runtimes without structured requests need no store. Journal-open failures install a refusal.
+ 
+ import type { AgentSessionAccountKind } from '../../shared/agent-session-availability'
+@@ -64,6 +65,8 @@ export type StructuredAgentSessionRuntimeDeps = StructuredAgentSessionTransportO
+   /** Host reactions to status, including the first-work workspace rename CLI hooks provide. */
+   onSessionStatusChanged?: StructuredAgentSessionHostDeps['onSessionStatusChanged']
+   conversationNaming?: StructuredAgentSessionHostDeps['conversationNaming']
++  /** Absent until this host supplies verified credit and exclusive continuation ownership. */
++  quotaFallback?: NativeQuotaFallbackConfig
+   /** See `StructuredAgentSessionHostDeps.hasOpenDispatch`. */
+   hasOpenDispatch?: StructuredAgentSessionHostDeps['hasOpenDispatch']
+   resolveCodexAccountKind?: (home: string) => AgentSessionAccountKind | undefined
+diff --git a/src/shared/agent-session-usage-limit.ts b/src/shared/agent-session-usage-limit.ts
+index 9de5bb5d1e..3faec6e221 100644
+--- a/src/shared/agent-session-usage-limit.ts
++++ b/src/shared/agent-session-usage-limit.ts
+@@ -11,6 +11,7 @@ export const AGENT_SESSION_USAGE_LIMIT_WINDOWS = [
+ export type AgentSessionUsageLimitWindow = (typeof AGENT_SESSION_USAGE_LIMIT_WINDOWS)[number]
+ 
+ export type AgentSessionUsageLimit = {
++  providerCode?: 'usage_limit_reached' | 'usageLimitExceeded'
+   window?: AgentSessionUsageLimitWindow
+   /** Epoch ms. Absent when the provider gave none, or any limit it hit had none. */
+   resetsAt?: number
+@@ -40,8 +41,16 @@ export function readAgentSessionUsageLimit(value: unknown): AgentSessionUsageLim
+     typeof record.resetsAt === 'number' && Number.isFinite(record.resetsAt) && record.resetsAt > 0
+       ? record.resetsAt
+       : undefined
+-  return window || resetsAt
+-    ? { ...(window ? { window } : {}), ...(resetsAt ? { resetsAt } : {}) }
++  const providerCode =
++    record.providerCode === 'usage_limit_reached' || record.providerCode === 'usageLimitExceeded'
++      ? record.providerCode
++      : undefined
++  return window || resetsAt || providerCode
++    ? {
++        ...(window ? { window } : {}),
++        ...(resetsAt ? { resetsAt } : {}),
++        ...(providerCode ? { providerCode } : {})
++      }
+     : undefined
+ }
+ 
