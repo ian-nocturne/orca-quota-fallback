@@ -16,7 +16,7 @@ Antigravity cross-provider handoff is **not implemented**. An unavailable Antigr
 
 The supported execution routes are Claude subscription → verified Claude API credit and Codex subscription → verified OpenAI API credit. The policy model can express Antigravity priority, but this release does not execute that handoff.
 
-A trusted host must provide `NativeQuotaFallbackConfig.verify` and `readApiKey`. Verification must be fresh and bound to the exact account, credential reference, model, and enforceable maximum debit. A configured dollar budget or a successful API login does not prove that paid overflow is blocked. In particular, the Codex API route has no CLI USD-cap flag: an externally verified debit cap is required before it is eligible. The default host configuration does not enable automatic spending.
+A trusted host must provide `NativeQuotaFallbackConfig.verify` and `readApiKey`. The verifier must return structured billing evidence; a boolean asserting a cap is no longer sufficient. See [BILLING.md](BILLING.md) for the enforcement contract and known provider limitations. Verification must be fresh and bound to the exact account, credential reference, model, and enforceable maximum debit. A configured dollar budget or a successful API login does not prove that paid overflow is blocked. In particular, the Codex API route has no CLI USD-cap flag: an externally verified debit cap is required before it is eligible. The default host configuration does not enable automatic spending.
 
 ## Apply and validate
 

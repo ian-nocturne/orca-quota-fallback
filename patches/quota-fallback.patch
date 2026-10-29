@@ -645,6 +645,79 @@ index 9e80a1934a..73c5a3e5f9 100644
    } finally {
      authority?.end()
      selected.place.release()
+diff --git a/src/main/native-chat/quota-fallback-billing-proof.ts b/src/main/native-chat/quota-fallback-billing-proof.ts
+new file mode 100644
+index 0000000000..7379531e59
+--- /dev/null
++++ b/src/main/native-chat/quota-fallback-billing-proof.ts
+@@ -0,0 +1,67 @@
++import { z } from 'zod'
++import type { NativeQuotaFallbackConfig } from './quota-fallback-native-config'
++
++const BillingProof = z.object({
++  evidenceId: z.string().min(1),
++  pool: z.string().min(1),
++  credentialRef: z.string().min(1),
++  sessionId: z.string().min(1),
++  sourceTurnId: z.string().min(1),
++  product: z.enum(['orca-claude-native', 'orca-codex-native']),
++  funding: z.literal('free-grant'),
++  productEligible: z.literal(true),
++  autoRecharge: z.literal(false),
++  paidOverflowBlocked: z.literal(true),
++  enforcement: z.literal('atomic-run-cap'),
++  maxDebitUsd: z.number().finite().positive(),
++  observedAt: z.number().finite(),
++  expiresAt: z.number().finite()
++})
++export type NativeQuotaBillingProof = z.infer<typeof BillingProof>
++
++/** The trusted adapter must obtain evidence from enforcement, not synthesize it from a budget setting. */
++export async function readVerifiedQuotaBilling(
++  config: NativeQuotaFallbackConfig,
++  input: Parameters<NativeQuotaFallbackConfig['verify']>[0],
++  now: () => number
++): Promise<Awaited<ReturnType<NativeQuotaFallbackConfig['verify']>>> {
++  const value = await config.verify(input)
++  const parsed = BillingProof.safeParse(value?.billingProof)
++  if (!value || !parsed.success) {
++    return null
++  }
++  const proof = parsed.data
++  const time = now()
++  const product = input.record.provider === 'claude' ? 'orca-claude-native' : 'orca-codex-native'
++  if (
++    !Number.isFinite(time) ||
++    proof.observedAt > time ||
++    time - proof.observedAt > 60_000 ||
++    proof.expiresAt <= time ||
++    proof.pool !== value.pool ||
++    proof.credentialRef !== value.credentialRef ||
++    proof.sessionId !== input.cut.sessionId ||
++    proof.sourceTurnId !== input.cut.turnItemId ||
++    proof.product !== product
++  ) {
++    return null
++  }
++  return {
++    ...value,
++    billingProof: proof,
++    candidates: value.candidates.map((candidate) => {
++      if (candidate.route === 'antigravity-opus') {
++        return { ...candidate }
++      }
++      const credit = candidate.credit
++      return {
++        ...candidate,
++        available: candidate.available && credit?.maxDebitUsd === proof.maxDebitUsd,
++        observedAt: Math.min(candidate.observedAt, proof.observedAt),
++        credit: credit
++          ? { ...credit, expiresAt: Math.min(credit.expiresAt, proof.expiresAt) }
++          : undefined
++      }
++    })
++  }
++}
 diff --git a/src/main/native-chat/quota-fallback-journal-cut.ts b/src/main/native-chat/quota-fallback-journal-cut.ts
 new file mode 100644
 index 0000000000..700827ec67
@@ -937,10 +1010,11 @@ index 0000000000..a417408db0
 +}
 diff --git a/src/main/native-chat/quota-fallback-native-config.ts b/src/main/native-chat/quota-fallback-native-config.ts
 new file mode 100644
-index 0000000000..73d108e9be
+index 0000000000..56416ea209
 --- /dev/null
 +++ b/src/main/native-chat/quota-fallback-native-config.ts
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,43 @@
++import type { NativeQuotaBillingProof } from './quota-fallback-billing-proof'
 +import type { AgentSessionRecord } from '../../shared/agent-session-record'
 +import type { StructuredAgentSessionHost } from './agent-session-wire/structured-agent-session-host'
 +import type { ConfirmedQuotaCut } from './quota-fallback-journal-cut'
@@ -953,7 +1027,7 @@ index 0000000000..73d108e9be
 +    pool: string
 +    credentialRef: string
 +    candidates: readonly QuotaFallbackCandidate[]
-+    maxDebitEnforced: boolean
++    billingProof: NativeQuotaBillingProof | null
 +  } | null>
 +  readApiKey(
 +    route: 'claude-api' | 'openai-api',
@@ -985,10 +1059,11 @@ index 0000000000..73d108e9be
 +}
 diff --git a/src/main/native-chat/quota-fallback-native-controller.ts b/src/main/native-chat/quota-fallback-native-controller.ts
 new file mode 100644
-index 0000000000..1f4f89079e
+index 0000000000..44f847af6d
 --- /dev/null
 +++ b/src/main/native-chat/quota-fallback-native-controller.ts
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,301 @@
++import { readVerifiedQuotaBilling } from './quota-fallback-billing-proof'
 +import { reportQuotaOutcome } from './quota-fallback-native-config'
 +import type { NativeQuotaFallbackConfig, NativeQuotaHost } from './quota-fallback-native-config'
 +import { verifyNativeQuotaCredential } from './quota-fallback-native-credential'
@@ -1073,11 +1148,13 @@ index 0000000000..1f4f89079e
 +      if (!host || !record || (record.provider !== 'claude' && record.provider !== 'codex')) {
 +        return
 +      }
-+      const verified = await this.deps.config.verify({ record, cut })
++      const verified = await readVerifiedQuotaBilling(this.deps.config, { record, cut }, () =>
++        this.now()
++      )
 +      if (this.disposed) {
 +        return
 +      }
-+      if (!verified || !verified.maxDebitEnforced) {
++      if (!verified || !verified.billingProof) {
 +        this.report(cut.sessionId, 'noVerifiedCreditCap')
 +        return
 +      }
@@ -1106,12 +1183,8 @@ index 0000000000..1f4f89079e
 +        this.report(cut.sessionId, decision.reason)
 +        return
 +      }
-+      if (decision.route === 'antigravity-opus') {
-+        this.report(cut.sessionId, 'crossProviderHandoffRequired')
-+        return
-+      }
 +      const candidate = verified.candidates.find((item) => item.route === decision.route)
-+      if (!candidate?.credit) {
++      if (decision.route === 'antigravity-opus' || !candidate?.credit) {
 +        return
 +      }
 +      const claimId = `quota-${createHash('sha256')
@@ -1293,10 +1366,11 @@ index 0000000000..1f4f89079e
 +}
 diff --git a/src/main/native-chat/quota-fallback-native-credential.ts b/src/main/native-chat/quota-fallback-native-credential.ts
 new file mode 100644
-index 0000000000..bb5646830b
+index 0000000000..a8fe70b199
 --- /dev/null
 +++ b/src/main/native-chat/quota-fallback-native-credential.ts
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,68 @@
++import { readVerifiedQuotaBilling } from './quota-fallback-billing-proof'
 +import type { AgentSessionRecord } from '../../shared/agent-session-record'
 +import type { NativeQuotaFallbackConfig } from './quota-fallback-native-config'
 +import type { NativeQuotaReservation } from './quota-fallback-native-store'
@@ -1316,10 +1390,10 @@ index 0000000000..bb5646830b
 +    turnItemId: entry.sourceTurnId,
 +    errorCode: entry.errorCode
 +  }
-+  const verified = await config.verify({ record, cut })
++  const verified = await readVerifiedQuotaBilling(config, { record, cut }, now)
 +  const candidate = verified?.candidates.find((value) => value.route === entry.route)
 +  if (
-+    !verified?.maxDebitEnforced ||
++    !verified?.billingProof ||
 +    verified.pool !== entry.pool ||
 +    verified.credentialRef !== entry.credentialRef ||
 +    !candidate?.credit ||
@@ -1700,10 +1774,10 @@ index 0000000000..11001f3b89
 +}
 diff --git a/src/main/native-chat/quota-fallback-native.test.ts b/src/main/native-chat/quota-fallback-native.test.ts
 new file mode 100644
-index 0000000000..105c378586
+index 0000000000..111e686416
 --- /dev/null
 +++ b/src/main/native-chat/quota-fallback-native.test.ts
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,291 @@
 +import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 +import { agentJournalItemKey } from '../../shared/agent-session-journal-item-key'
 +import { agentSessionFailureWords } from '../../shared/agent-session-failure-words'
@@ -1729,11 +1803,26 @@ index 0000000000..105c378586
 +  now = NOW
 +  config = {
 +    enabled: true,
-+    verify: vi.fn<NativeQuotaFallbackConfig['verify']>(async () => ({
++    verify: vi.fn<NativeQuotaFallbackConfig['verify']>(async ({ cut }) => ({
 +      billing: 'subscription',
 +      pool: 'test-pool',
 +      credentialRef: 'test-key-ref',
-+      maxDebitEnforced: true,
++      billingProof: {
++        evidenceId: 'fake-enforcement-proof',
++        pool: 'test-pool',
++        credentialRef: 'test-key-ref',
++        sessionId: cut.sessionId,
++        sourceTurnId: cut.turnItemId,
++        product: 'orca-codex-native',
++        funding: 'free-grant',
++        productEligible: true,
++        autoRecharge: false,
++        paidOverflowBlocked: true,
++        enforcement: 'atomic-run-cap',
++        maxDebitUsd: 1,
++        observedAt: NOW,
++        expiresAt: NOW + 120_000
++      },
 +      candidates: [
 +        {
 +          route: 'openai-api',
@@ -1852,7 +1941,7 @@ index 0000000000..105c378586
 +it('requires an enforced budget and exact account binding', async () => {
 +  const cut = await quotaCut()
 +  const verify = config.verify
-+  config.verify = async (input) => ({ ...(await verify(input))!, maxDebitEnforced: false })
++  config.verify = async (input) => ({ ...(await verify(input))!, billingProof: null })
 +  await controller.onCut(cut)
 +  expect(rig.dispatch).not.toHaveBeenCalled()
 +  config.verify = verify
@@ -1932,6 +2021,54 @@ index 0000000000..105c378586
 +    expect(reply).toMatchObject({ ok: false, refusal: { details: { reason: 'handoffInFlight' } } })
 +  }
 +)
++
++it.each([
++  ['no proof', null],
++  ['budget alert', { enforcement: 'spend-alert' }],
++  ['delayed monthly cutoff', { enforcement: 'monthly-hard-limit-delayed' }],
++  ['prepaid balance', { enforcement: 'prepaid-balance' }],
++  ['other product', { product: 'orca-claude-native' }],
++  ['ineligible grant', { productEligible: false }],
++  ['purchased credit', { funding: 'purchased-credit' }],
++  ['automatic recharge', { autoRecharge: true }],
++  ['paid overflow', { paidOverflowBlocked: false }],
++  ['different account', { pool: 'other-pool' }],
++  ['different key', { credentialRef: 'other-ref' }],
++  ['different session', { sessionId: 'other-session' }],
++  ['different turn', { sourceTurnId: 'other-turn' }],
++  ['stale evidence', { observedAt: NOW - 60_001 }],
++  ['future evidence', { observedAt: NOW + 1 }],
++  ['expired cap', { expiresAt: NOW }],
++  ['larger debit than cap', { maxDebitUsd: 0.5 }]
++])('holds before reading a key for %s', async (_name, changes) => {
++  const verify = config.verify
++  config.verify = async (input) => {
++    const value = (await verify(input))!
++    return {
++      ...value,
++      billingProof: changes === null ? null : Object.assign(value.billingProof!, changes)
++    }
++  }
++  await controller.onCut(await quotaCut())
++  expect(rig.dispatch).not.toHaveBeenCalled()
++  expect(config.readApiKey).not.toHaveBeenCalled()
++  expect(config.report).not.toHaveBeenCalledWith(SESSION, 'submitted')
++})
++
++it('rejects a cap that expires while fetching the secret even when the credit remains valid', async () => {
++  const verify = config.verify
++  config.verify = async (input) => {
++    const value = (await verify(input))!
++    value.billingProof!.expiresAt = NOW + 1000
++    return value
++  }
++  await controller.onCut(await quotaCut())
++  config.readApiKey = vi.fn(async () => {
++    now += 1001
++    return 'fake-key'
++  })
++  await expect(controller.credentials(SESSION)).rejects.toThrow('credential unavailable')
++})
 diff --git a/src/main/native-chat/quota-fallback-policy.test.ts b/src/main/native-chat/quota-fallback-policy.test.ts
 new file mode 100644
 index 0000000000..352fc7b161

@@ -16,6 +16,7 @@
   "src/main/native-chat/agent-session-wire/structured-agent-session-host.ts",
   "src/main/native-chat/agent-session-wire/structured-agent-session-ready-operation-plan.ts",
   "src/main/native-chat/agent-session-wire/structured-agent-session-ready-operation.ts",
+  "src/main/native-chat/quota-fallback-billing-proof.ts",
   "src/main/native-chat/quota-fallback-journal-cut.ts",
   "src/main/native-chat/quota-fallback-ledger.test.ts",
   "src/main/native-chat/quota-fallback-ledger.ts",
