@@ -18,6 +18,10 @@ The supported execution routes are Claude subscription → verified Claude API c
 
 A trusted host must provide `NativeQuotaFallbackConfig.verify` and `readApiKey`. The verifier must return structured billing evidence; a boolean asserting a cap is no longer sufficient. See [BILLING.md](BILLING.md) for the enforcement contract and known provider limitations. Verification must be fresh and bound to the exact account, credential reference, model, and enforceable maximum debit. A configured dollar budget or a successful API login does not prove that paid overflow is blocked. In particular, the Codex API route has no CLI USD-cap flag: an externally verified debit cap is required before it is eligible. The default host configuration does not enable automatic spending.
 
+## Supervised skill workflow
+
+The [quota-fallback skill](skills/quota-fallback/SKILL.md) asks the user to enable the scoped spending cutoff, waits for confirmation, then permits supervised execution within that authorization. The confirmation is an attestation, not provider-verified evidence. Credit eligibility and duplicate-execution checks still apply. This does not enable the unattended native controller or bypass its billing-proof requirement.
+
 ## Apply and validate
 
 This repository distributes an allowlisted patch, not an Orca binary or a copy of a user's workspace. See [VALIDATION.md](VALIDATION.md) for the pinned upstream base and reproducible commands. Review the patch before applying it. Do not enable execution merely because the unit tests pass.

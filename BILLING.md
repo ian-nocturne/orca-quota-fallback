@@ -15,3 +15,7 @@ The validator rejects missing proof, alerts, prepaid balance alone, delayed mont
 - Client budgets and the local reservation ledger do not intercept or price every upstream request. Do not equate them with a provider-enforced monetary ceiling. An enforcement adapter must account for concurrent requests, retries, child agents, tools, expiration, and other consumers of the same pool.
 
 The current release remains disabled by default. It does not claim that free-credit-only operation is deployable on every provider account. All automated tests use fake proofs and credentials; no live billing assurance follows from their passing.
+
+## Supervised user confirmation
+
+The optional [skill workflow](skills/quota-fallback/SKILL.md) accepts the user's explicit confirmation that the scoped spending cutoff is enabled as its billing approval gate. It does not require an atomic-cap proof for supervised execution. Record that confirmation as `user_confirmed`; do not claim that it eliminates provider enforcement delay. This workflow is separate from the native automatic controller above, which still requires its structured proof. Changing the workflow itself is not confirmation that a cutoff has been enabled.
